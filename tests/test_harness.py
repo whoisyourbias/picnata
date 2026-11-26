@@ -182,20 +182,28 @@ class LockTests(unittest.TestCase):
         self.assertEqual(3, len(refused))
 
     def test_creation_waits_for_the_reclaim_mutex(self):
-        """A runner must not create the lock while a reclaimer holds the mutex."""
+        """A runner must not touch the lock while another holder has the OS mutex, however long it takes."""
+        import threading
         self.lock.parent.mkdir()
         mutex = self.lock.with_suffix(".reclaim")
-        mutex.write_text("", encoding="utf-8")
-        sleeps = []
+        entered = []
 
-        def fake_sleep(seconds):
-            sleeps.append(seconds)
-            mutex.unlink()
-
-        with patch.object(orchestrator.time, "sleep", fake_sleep):
+        def worker():
             with orchestrator.step_lock(self.state, "demo", "implement"):
-                self.assertEqual(1, len(sleeps))
-        self.assertFalse(mutex.exists())
+                entered.append(time.time())
+
+        with orchestrator.os_mutex(mutex):
+            # Even a mutex file that looks ancient must not be taken over from a live holder.
+            os.utime(mutex, (0, 0))
+            thread = threading.Thread(target=worker)
+            thread.start()
+            time.sleep(0.4)
+            self.assertEqual([], entered)
+            released = time.time()
+        thread.join(10)
+        self.assertEqual(1, len(entered))
+        self.assertGreaterEqual(entered[0], released)
+        self.assertFalse(self.lock.exists())
 
     def test_lock_is_removed_on_exception(self):
         with self.assertRaises(RuntimeError):
@@ -473,6 +481,40 @@ class RunTests(GitFlowTestCase):
             self.assertEqual(1, self.run_cli())
             agent.assert_not_called()
         self.assertIn("이미 실행 중", self.stderr)
+
+    def test_live_lock_is_reported_even_while_the_worktree_is_dirty(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        (self.worktree / "half-written.txt").write_text("x", encoding="utf-8")
+        (self.state / "locks").mkdir(parents=True, exist_ok=True)
+        (self.state / "locks" / "demo.json").write_text(
+            json.dumps({"pid": os.getpid(), "step": "implement"}), encoding="utf-8")
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("이미 실행 중", self.stderr)
+        self.assertNotIn("커밋 안 된 변경", self.stderr)
+
+    def test_rerun_after_the_pr_is_merged_does_nothing(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        run_git(self.root, "fetch", "origin")
+        run_git(self.root, *IDENT, "merge", "--no-ff", "-m", "merge", "origin/harness/demo")
+        run_git(self.root, "push", "origin", "main")
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(0, self.run_cli(), self.stderr)
+            agent.assert_not_called()
+        self.assertEqual(1, len((self.gh_state / "calls.log").read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(3, len(orchestrator.read_commits(self.worktree, merged_task="demo")))
+
+    def test_trailer_keeps_inner_spaces_of_the_command(self):
+        command = 'python -c "print(\'a  b\')"'
+        message = orchestrator.build_message("s", "body", [("Harness-Command", command), ("Harness-Task", "a\nb")])
+        trailers = orchestrator.parse_trailers(message)
+        self.assertEqual(command, trailers["Harness-Command"])
+        self.assertEqual("a b", trailers["Harness-Task"])
 
     def test_stale_plan_is_not_executed(self):
         """Another run advanced the branch between planning and taking the lock."""

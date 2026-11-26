@@ -266,7 +266,9 @@ def build_message(subject, body, trailers):
     parts = [subject]
     if body := clip(body):
         parts.append(body)
-    parts.append("\n".join(f"{key}: {' '.join(str(value).split())}" for key, value in trailers))
+    # Only line breaks are folded; inner spaces stay so Harness-Command matches what was executed.
+    fold = re.compile(r"[\r\n]+")
+    parts.append("\n".join(f"{key}: {fold.sub(' ', str(value)).strip()}" for key, value in trailers))
     return "\n\n".join(parts) + "\n"
 
 
@@ -355,12 +357,56 @@ def read_lock(path):
     return data if isinstance(data, dict) else None
 
 
+def lock_busy_error(path, task_id):
+    """ValueError when a live run owns the lock file at path, else None (absent, dead owner, torn file)."""
+    info = read_lock(path)
+    if info is None:
+        try:
+            young = time.time() - path.stat().st_mtime < 5
+        except OSError:
+            return None
+        return ValueError(f"{task_id}: 이미 실행 중입니다.") if young else None
+    if pid_alive(info.get("pid")):
+        return ValueError(f"{task_id}: 이미 실행 중입니다 ({info.get('step')}, pid {info.get('pid')}).")
+    return None
+
+
+@contextmanager
+def os_mutex(path):
+    """Exclusive OS lock on a file; the OS releases it when the holder exits, so it never goes stale."""
+    handle = open(path, "a+b")
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 @contextmanager
 def step_lock(state, task_id, step):
     """Exclusive lock file for the duration of a step; a dead owner's file is reclaimed."""
     path = state / "locks" / f"{task_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    mutex = path.with_suffix(".reclaim")
 
     def create():
         try:
@@ -372,47 +418,18 @@ def step_lock(state, task_id, step):
                        "started": datetime.now(timezone.utc).isoformat()}, handle)
         return True
 
-    def busy_error():
-        info = read_lock(path)
-        if info is None:
-            try:
-                young = time.time() - path.stat().st_mtime < 5
-            except OSError:
-                return None
-            return ValueError(f"{task_id}: 이미 실행 중입니다.") if young else None
-        if pid_alive(info.get("pid")):
-            return ValueError(f"{task_id}: 이미 실행 중입니다 ({info.get('step')}, pid {info.get('pid')}).")
-        return None
-
-    while True:
-        # Creation and stale-lock reclamation both run under the mutex, so a reclaimer can never
-        # delete a lock another runner just created.
-        try:
-            os.close(os.open(mutex, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        except FileExistsError:
-            try:
-                if time.time() - mutex.stat().st_mtime > 10:
-                    mutex.unlink()
-            except OSError:
-                pass
-            time.sleep(0.05)
-            continue
-        try:
-            if create():
-                break
-            if (error := busy_error()) is not None:
+    # Creation and stale-lock reclamation both run under an OS mutex, so a reclaimer can never
+    # delete a lock another runner just created, however long a participant is suspended.
+    with os_mutex(path.with_suffix(".reclaim")):
+        if not create():
+            if (error := lock_busy_error(path, task_id)) is not None:
                 raise error
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
-            if create():
-                break
-        finally:
-            try:
-                mutex.unlink()
-            except FileNotFoundError:
-                pass
+            if not create():
+                raise ValueError(f"{task_id}: 이미 실행 중입니다.")
     try:
         yield path
     finally:
@@ -474,9 +491,10 @@ def open_pr(cwd, head, title, body):
     if executable is None:
         raise ValueError(f"gh를 설치하고 gh auth login 하세요. 브랜치 {head}는 push했습니다. "
                          f"PR은 직접 만드세요: {manual_pr_url(cwd, head)}")
-    if url := find_pr(executable, cwd, head):
-        print(f"PR: {url}")
-        return url
+    for state in ("open", "merged"):
+        if url := find_pr(executable, cwd, head, state):
+            print(f"PR: {url}")
+            return url
     try:
         output = run_gh(executable, cwd, "pr", "create", "--base", "main", "--head", head,
                         "--title", title, "--body-file", "-", input=body)
@@ -743,8 +761,11 @@ def run_task(args, cwd):
     task = Task(args, main_root, state, worktree, spec_path, spec, command_text, command)
     implements = 0
     while True:
+        # A running step may be editing the worktree; report that before complaining about its changes.
+        if (error := lock_busy_error(state / "locks" / f"{args.id}.json", args.id)) is not None:
+            raise error
         ensure_clean(worktree)
-        commits = read_commits(worktree)
+        commits = read_commits(worktree, merged_task=args.id)
         step, round_number, last = plan_next(commits)
         if step == "done":
             print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
@@ -763,7 +784,7 @@ def run_task(args, cwd):
                     push_branch(worktree, args.id)
                 # The plan above was made without the lock; decide again now that we own it.
                 ensure_clean(worktree)
-                commits = read_commits(worktree)
+                commits = read_commits(worktree, merged_task=args.id)
                 if plan_next(commits)[:2] != (step, round_number):
                     raise ValueError(f"{args.id}: 다른 실행이 단계를 진행했습니다. 다시 run 하세요.")
                 last = plan_next(commits)[2]
