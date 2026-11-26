@@ -25,6 +25,7 @@ WAIT_INTERVAL = 30
 TRAILER_LINE = re.compile(r"(Harness-[A-Za-z]+):[ \t]*(.*)")
 AUTHOR = ["-c", "user.name=harness", "-c", "user.email=harness@example.invalid", "-c", "commit.gpgsign=false"]
 STEP_ORDER = ("implement", "review", "verify")
+ADOPT_HINT = "사람이 한 수정이면 --adopt로 이어받을 수 있습니다."
 
 REVIEW_INSTRUCTIONS = """\
 Independently review the committed changes against the task specification. Keep the worktree \
@@ -367,9 +368,9 @@ def message_body(message):
     return "\n\n".join(paragraphs[1:]).strip()
 
 
-def build_message(subject, body, trailers):
+def build_message(subject, body, trailers, clip_body=True):
     parts = [subject]
-    if body := clip(body):
+    if body := (clip(body) if clip_body else (body or "").strip()):
         parts.append(body)
     # Only line breaks are folded; inner spaces stay so Harness-Command matches what was executed.
     fold = re.compile(r"[\r\n]+")
@@ -404,7 +405,8 @@ def plan_next(commits):
     """Compute (step, round, last harness commit) from the trailers of a branch, newest commit first."""
     harness = [c for c in commits if "Harness-Step" in c["trailers"]]
     if len(commits) != len(harness) and (not harness or commits[0] is not harness[0]):
-        raise ValueError("마지막 하네스 커밋 뒤에 트레일러 없는 커밋이 있습니다. 확인한 뒤 되돌리거나 사람이 정리하세요.")
+        raise ValueError("마지막 하네스 커밋 뒤에 트레일러 없는 커밋이 있습니다. 확인한 뒤 되돌리거나 사람이 정리하세요.\n"
+                         f"{ADOPT_HINT}")
     if not harness:
         return "implement", 1, None
     last = harness[0]
@@ -876,6 +878,60 @@ def trees_equal(worktree, first, second):
     return git(worktree, "rev-parse", f"{first}^{{tree}}") == git(worktree, "rev-parse", f"{second}^{{tree}}")
 
 
+def adopt_human_commits(worktree, task_id, commits, spec_path):
+    """Record the trailerless commits after the last harness commit as a new implement round by
+    Harness-Agent: human, so review and verify run on them next. commits is newest first.
+
+    Returns (adopt commit SHA, adopted range, round), or None when there is nothing to adopt. The adopt
+    commit is empty: the tree that review approves and verify tests includes the human changes."""
+    newest_harness = next((index for index, commit in enumerate(commits)
+                           if "Harness-Step" in commit["trailers"]), len(commits))
+    pending = commits[:newest_harness]
+    if not pending:
+        return None
+    ensure_clean(worktree)
+    # Only the exact range an earlier adopt record names counts as adopted.
+    covered = set()
+    for commit in commits:
+        recorded = commit["trailers"].get("Harness-Adopted")
+        if recorded and "Harness-Step" in commit["trailers"]:
+            first, _, last = recorded.partition("..")
+            if first and last:
+                try:
+                    covered.update(git(worktree, "rev-list", f"{first}^..{last}").split())
+                except ValueError:
+                    pass
+    pending_shas = {commit["sha"] for commit in pending}
+    trailerless = [commit for commit in commits
+                   if "Harness-Step" not in commit["trailers"] and commit["sha"] not in covered]
+    for commit in trailerless:
+        if len(git(worktree, "rev-list", "--parents", "-n", "1", commit["sha"]).split()) > 2:
+            raise ValueError(f"이어받을 커밋 {commit['sha'][:12]}가 머지 커밋입니다. "
+                             "머지 없이 커밋을 다시 쌓은 뒤 --adopt 하세요.")
+    if stray := [commit for commit in trailerless if commit["sha"] not in pending_shas]:
+        raise ValueError(f"트레일러 없는 커밋 {stray[0]['sha'][:12]} 뒤에 하네스 커밋이 끼어 있어 이어받을 수 없습니다. "
+                         "이어받을 커밋은 마지막 하네스 커밋 뒤에 연속으로 있어야 합니다.")
+    oldest, newest = pending[-1]["sha"], pending[0]["sha"]
+    if git(worktree, "log", "--format=%H", f"{oldest}^..{newest}", "--", spec_path):
+        raise ValueError(f"이어받을 커밋이 승인된 명세 {spec_path}를 수정합니다. 명세 변경은 새 명세 PR로 하세요.")
+    if trees_equal(worktree, "origin/main", newest):
+        raise ValueError("이어받을 변경이 없습니다.")
+    round_number = max((int(commit["trailers"].get("Harness-Round", 0) or 0) for commit in commits
+                        if commit["trailers"].get("Harness-Step") == "implement"), default=0) + 1
+    listed = []
+    for commit in reversed(pending):
+        author, _, subject = git(worktree, "log", "-1", "--format=%an%x1f%s", commit["sha"]).partition("\x1f")
+        listed.append(f"{commit['sha'][:12]} {author} {subject}")
+    adopted = f"{oldest}..{newest}"
+    message = build_message(
+        f"harness({task_id}): adopt human commits", "\n".join(listed),
+        [("Harness-Task", task_id), ("Harness-Step", "implement"), ("Harness-Agent", "human"),
+         ("Harness-Round", round_number), ("Harness-Adopted", adopted)],
+        # Every adopted commit keeps its line: the list is the record a person checks in the PR.
+        clip_body=False)
+    return harness_commit(worktree, message), adopted, round_number
+
+
 class Task:
     def __init__(self, args, main_root, state, worktree, spec_path, spec, command_text, command):
         self.args, self.main_root, self.state, self.worktree = args, main_root, state, worktree
@@ -917,6 +973,7 @@ class Task:
         diff = git(self.worktree, "diff", "--no-ext-diff", "--no-textconv", "origin/main...HEAD", "--")
         prompt = f"{REVIEW_INSTRUCTIONS}\n\nTask specification\n{self.spec}\n\nCommit {commit}\n\n{diff}"
         # The reviewer is the counterpart of whoever implemented the commit, not of the current CLI agent.
+        # An adopted round (Harness-Agent: human) is reviewed by the counterpart of the CLI agent.
         implementer = (last["trailers"].get("Harness-Agent") if last else None)
         reviewer = OTHER_AGENT[implementer if implementer in OTHER_AGENT else self.agent]
         final = run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout)
@@ -983,6 +1040,8 @@ class Task:
             if not step:
                 continue
             detail = trailers.get("Harness-Verdict") or trailers.get("Harness-Result") or ""
+            if adopted := trailers.get("Harness-Adopted"):
+                detail = f"adopted {adopted}"
             round_text = f" round {trailers['Harness-Round']}" if step == "implement" else ""
             lines.append(f"- {step}{round_text}{' ' + detail if detail else ''}: {commit['sha'][:12]}")
         lines += ["", "머지는 사람이 결정합니다."]
@@ -1022,6 +1081,12 @@ def run_task(args, cwd):
                 sync_remote(worktree, args.id)
                 # Plan first: plan_next rejects commits without trailers before anything is pushed.
                 commits = read_commits(worktree, merged_task=args.id)
+                if args.adopt and (adoption := adopt_human_commits(worktree, args.id, commits, spec_path)):
+                    # Adopting is not an implement run, so it does not count toward --max-rounds.
+                    sha, adopted, adopted_round = adoption
+                    print(f"{args.id}: adopted {adopted} as implement round {adopted_round} {sha[:12]}")
+                    push_branch(worktree, args.id)
+                    commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
                 if step == "done":
                     print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
@@ -1074,11 +1139,22 @@ def status(args, cwd):
     print(f"task: {args.id}\nspec approved (origin/main): {'yes' if approved else 'no'}")
     if local or remote:
         commits = read_commits(main_root, branch if local else f"origin/{branch}", merged_task=args.id)
-        step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
+        try:
+            step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
+        except ValueError as error:
+            # Unadopted human commits: still show where the branch stands and keep the adoption history.
+            harness = [c for c in commits if "Harness-Step" in c["trailers"]]
+            rounds = [int(c["trailers"].get("Harness-Round", 0) or 0) for c in harness
+                      if c["trailers"]["Harness-Step"] == "implement"]
+            step, round_number = "adopt (--adopt 필요: 트레일러 없는 커밋 있음)", max(rounds, default=1)
+            print(f"warning: {str(error).splitlines()[0]}", file=sys.stderr)
         verdict = next((c["trailers"].get("Harness-Verdict") for c in commits
                         if c["trailers"].get("Harness-Step") == "review"), None)
         pushed = remote and (not local or git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}"))
         print(f"next step: {step}\nround: {round_number}\nlast verdict: {verdict or '-'}")
+        for commit in reversed(commits):
+            if "Harness-Step" in commit["trailers"] and (adopted := commit["trailers"].get("Harness-Adopted")):
+                print(f"adopted: {adopted} (round {commit['trailers'].get('Harness-Round', '?')})")
         print(f"branch: {branch}\npushed: {'yes' if pushed else 'no'}")
     else:
         print(f"next step: implement\nround: 1\nlast verdict: -\nbranch: - (아직 run 하지 않음)\npushed: no")
@@ -1158,6 +1234,9 @@ def parse_args(argv):
                                            help="Maximum implement runs before asking a human.")
     subparsers.choices["run"].add_argument("--wait", type=float, default=0, metavar="SECONDS",
                                            help="Wait this long for the specification PR to be merged.")
+    subparsers.choices["run"].add_argument("--adopt", action="store_true",
+                                           help="Record commits without trailers after the last harness commit "
+                                                "as a human implement round, then review and verify them.")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", args.id):
         parser.error("Use a task ID of 1–64 lowercase letters, digits and hyphens, starting with a letter.")

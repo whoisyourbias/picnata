@@ -110,6 +110,22 @@ class GateTests(unittest.TestCase):
         base = self.full_branch()
         self.assertEqual([], self.check("harness/demo", base))
 
+    def test_branch_with_adopted_human_commit_passes(self):
+        self.base_with_spec()
+        base = self.sha()
+        run_git(self.root, "checkout", "-q", "-b", "harness/demo")
+        self.write("result.txt", "done")
+        implemented = self.step("implement", Harness_Agent="codex", Harness_Round="1")
+        self.step("review", Harness_Reviewed=implemented, Harness_Verdict="REQUEST_CHANGES")
+        self.write(".claude/settings.json", "{}")
+        run_git(self.root, *IDENT, "commit", "-m", "human fix")
+        human = self.sha()
+        adopted = self.step("implement", f"{human[:12]} T human fix", Harness_Agent="human",
+                            Harness_Round="2", Harness_Adopted=f"{human}..{human}")
+        self.step("review", Harness_Reviewed=adopted, Harness_Verdict="APPROVE")
+        self.step("verify", Harness_Verified=adopted, Harness_Result="pass", Harness_Command="x")
+        self.assertEqual([], self.check("harness/demo", base))
+
     def test_missing_verify_fails(self):
         self.base_with_spec()
         base = self.sha()
