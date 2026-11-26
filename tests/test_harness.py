@@ -181,6 +181,22 @@ class LockTests(unittest.TestCase):
         self.assertEqual(1, len(inside))
         self.assertEqual(3, len(refused))
 
+    def test_creation_waits_for_the_reclaim_mutex(self):
+        """A runner must not create the lock while a reclaimer holds the mutex."""
+        self.lock.parent.mkdir()
+        mutex = self.lock.with_suffix(".reclaim")
+        mutex.write_text("", encoding="utf-8")
+        sleeps = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            mutex.unlink()
+
+        with patch.object(orchestrator.time, "sleep", fake_sleep):
+            with orchestrator.step_lock(self.state, "demo", "implement"):
+                self.assertEqual(1, len(sleeps))
+        self.assertFalse(mutex.exists())
+
     def test_lock_is_removed_on_exception(self):
         with self.assertRaises(RuntimeError):
             with orchestrator.step_lock(self.state, "demo", "review"):
@@ -538,6 +554,29 @@ class RunTests(GitFlowTestCase):
             self.assertEqual(0, self.run_cli(), self.stderr)
         with patch.object(orchestrator, "push_branch", side_effect=ValueError("offline")):
             self.assertEqual(0, self.run_cli(), self.stderr)
+
+    def test_resume_reviews_with_counterpart_of_the_implementer(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())  # codex implemented
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.cli("run", "demo", "claude"), self.stderr)
+        self.assertEqual([("claude", "review")], [(call[0], call[1]) for call in self.calls])
+
+    def test_status_keeps_history_after_the_branch_is_merged(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        run_git(self.root, "fetch", "origin")
+        run_git(self.root, *IDENT, "merge", "--no-ff", "-m", "merge", "origin/harness/demo")
+        run_git(self.root, "push", "origin", "main")
+        self.assertEqual("", run_git(self.root, "log", "origin/main..origin/harness/demo"))
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, orchestrator.main(["status", "demo"], cwd=self.root))
+        self.assertIn("next step: done", stdout.getvalue())
+        self.assertIn("last verdict: APPROVE", stdout.getvalue())
 
     def test_status_reads_stage_from_git(self):
         self.merge_spec()

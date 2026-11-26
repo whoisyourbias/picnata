@@ -275,9 +275,15 @@ def harness_commit(worktree, message):
     return git(worktree, "rev-parse", "HEAD")
 
 
-def read_commits(cwd, ref="HEAD"):
-    """Commits on ref since origin/main, newest first, with parsed trailers."""
+def read_commits(cwd, ref="HEAD", merged_task=None):
+    """Commits on ref since origin/main, newest first, with parsed trailers.
+
+    With merged_task, a branch already contained in origin/main (after a merge) falls back to its
+    harness step commits found by trailer, so the stage history survives the merge."""
     output = git(cwd, "log", "--format=%H%x1f%B%x1e", f"origin/main..{ref}")
+    if merged_task and not output.strip():
+        output = git(cwd, "log", "--format=%H%x1f%B%x1e", "--all-match", f"--grep=^Harness-Task: {merged_task}$",
+                     "--grep=^Harness-Step: ", ref)
     commits = []
     for chunk in output.split("\x1e"):
         if not chunk.strip():
@@ -378,10 +384,9 @@ def step_lock(state, task_id, step):
             return ValueError(f"{task_id}: 이미 실행 중입니다 ({info.get('step')}, pid {info.get('pid')}).")
         return None
 
-    while not create():
-        if (error := busy_error()) is not None:
-            raise error
-        # Stale lock: reclaim under a mutex so two reclaimers cannot delete each other's new lock.
+    while True:
+        # Creation and stale-lock reclamation both run under the mutex, so a reclaimer can never
+        # delete a lock another runner just created.
         try:
             os.close(os.open(mutex, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         except FileExistsError:
@@ -393,6 +398,8 @@ def step_lock(state, task_id, step):
             time.sleep(0.05)
             continue
         try:
+            if create():
+                break
             if (error := busy_error()) is not None:
                 raise error
             try:
@@ -637,7 +644,7 @@ class Task:
              ("Harness-Round", round_number)])
         return harness_commit(self.worktree, message)
 
-    def review(self, log):
+    def review(self, log, last=None):
         ensure_clean(self.worktree)
         commit = git(self.worktree, "rev-parse", "HEAD")
         diff = git(self.worktree, "diff", "--no-ext-diff", "--no-textconv", "origin/main...HEAD", "--")
@@ -649,7 +656,9 @@ class Task:
             "with nothing after it.\n\n"
             f"Task specification\n{self.spec}\n\nCommit {commit}\n\n{diff}"
         )
-        reviewer = OTHER_AGENT[self.agent]
+        # The reviewer is the counterpart of whoever implemented the commit, not of the current CLI agent.
+        implementer = (last["trailers"].get("Harness-Agent") if last else None)
+        reviewer = OTHER_AGENT[implementer if implementer in OTHER_AGENT else self.agent]
         final = run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout)
         ensure_clean(self.worktree)
         if git(self.worktree, "rev-parse", "HEAD") != commit:
@@ -761,7 +770,7 @@ def run_task(args, cwd):
                 if step == "implement":
                     sha, result = task.implement(round_number, last, log), None
                 elif step == "review":
-                    sha, result = task.review(log)
+                    sha, result = task.review(log, last)
                 else:
                     sha, result = task.verify(commits, log)
                 print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
@@ -792,7 +801,7 @@ def status(args, cwd):
     approved = git_ok(main_root, "cat-file", "-e", f"origin/main:docs/tasks/{args.id}.md")
     print(f"task: {args.id}\nspec approved (origin/main): {'yes' if approved else 'no'}")
     if local or remote:
-        commits = read_commits(main_root, branch if local else f"origin/{branch}")
+        commits = read_commits(main_root, branch if local else f"origin/{branch}", merged_task=args.id)
         step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
         verdict = next((c["trailers"].get("Harness-Verdict") for c in commits
                         if c["trailers"].get("Harness-Step") == "review"), None)
