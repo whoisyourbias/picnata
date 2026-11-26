@@ -368,9 +368,9 @@ def message_body(message):
     return "\n\n".join(paragraphs[1:]).strip()
 
 
-def build_message(subject, body, trailers):
+def build_message(subject, body, trailers, clip_body=True):
     parts = [subject]
-    if body := clip(body):
+    if body := (clip(body) if clip_body else (body or "").strip()):
         parts.append(body)
     # Only line breaks are folded; inner spaces stay so Harness-Command matches what was executed.
     fold = re.compile(r"[\r\n]+")
@@ -911,7 +911,7 @@ def adopt_human_commits(worktree, task_id, commits, spec_path):
     oldest, newest = pending[-1]["sha"], pending[0]["sha"]
     if git(worktree, "log", "--format=%H", f"{oldest}^..{newest}", "--", spec_path):
         raise ValueError(f"이어받을 커밋이 승인된 명세 {spec_path}를 수정합니다. 명세 변경은 새 명세 PR로 하세요.")
-    if trees_equal(worktree, f"{oldest}^", newest) or trees_equal(worktree, "origin/main", newest):
+    if trees_equal(worktree, "origin/main", newest):
         raise ValueError("이어받을 변경이 없습니다.")
     round_number = max((int(commit["trailers"].get("Harness-Round", 0) or 0) for commit in commits
                         if commit["trailers"].get("Harness-Step") == "implement"), default=0) + 1
@@ -923,7 +923,9 @@ def adopt_human_commits(worktree, task_id, commits, spec_path):
     message = build_message(
         f"harness({task_id}): adopt human commits", "\n".join(listed),
         [("Harness-Task", task_id), ("Harness-Step", "implement"), ("Harness-Agent", "human"),
-         ("Harness-Round", round_number), ("Harness-Adopted", adopted)])
+         ("Harness-Round", round_number), ("Harness-Adopted", adopted)],
+        # Every adopted commit keeps its line: the list is the record a person checks in the PR.
+        clip_body=False)
     return harness_commit(worktree, message), adopted, round_number
 
 
@@ -1134,7 +1136,14 @@ def status(args, cwd):
     print(f"task: {args.id}\nspec approved (origin/main): {'yes' if approved else 'no'}")
     if local or remote:
         commits = read_commits(main_root, branch if local else f"origin/{branch}", merged_task=args.id)
-        step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
+        try:
+            step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
+        except ValueError:
+            # Trailerless commits after the last harness commit: report the branch instead of failing,
+            # so earlier adoptions and the rest of the status still show.
+            step = "blocked (트레일러 없는 커밋; 정리하거나 run --adopt로 이어받으세요)"
+            round_number = max((int(c["trailers"].get("Harness-Round", 0) or 0) for c in commits
+                                if c["trailers"].get("Harness-Step") == "implement"), default=1)
         verdict = next((c["trailers"].get("Harness-Verdict") for c in commits
                         if c["trailers"].get("Harness-Step") == "review"), None)
         pushed = remote and (not local or git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}"))

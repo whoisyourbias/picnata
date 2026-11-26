@@ -1318,11 +1318,45 @@ class AdoptTests(GitFlowTestCase):
         self.human_commit("b.txt", "b")
         self.assert_refused("끼어")
 
-    def test_reverted_change_is_refused(self):
-        self.after_implement()
+    def test_tree_equal_to_origin_main_is_refused(self):
+        self.merge_spec()
+        orchestrator.ensure_worktree(self.root, self.state, "demo")
         self.human_commit("a.txt", "a")
         run_git(self.worktree, *IDENT, "revert", "--no-edit", "HEAD")
         self.assert_refused("이어받을 변경이 없습니다")
+
+    def test_reverted_human_change_on_a_changed_branch_is_adopted(self):
+        # The comparison is against origin/main: the implement round's result.txt is still there.
+        self.after_implement()
+        first = self.human_commit("a.txt", "a")
+        run_git(self.worktree, *IDENT, "revert", "--no-edit", "HEAD")
+        last = run_git(self.worktree, "rev-parse", "HEAD")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
+        self.assertEqual(f"{first}..{last}", self.adopt_commits()[0]["trailers"]["Harness-Adopted"])
+
+    def test_long_adoption_list_is_not_clipped(self):
+        self.after_implement()
+        subjects = [f"human change {i:03d} " + "x" * 80 for i in range(100)]
+        for i, subject in enumerate(subjects):
+            run_git(self.worktree, *IDENT, "commit", "--allow-empty", "-m", subject)
+        self.human_commit("final.txt", "final", "final human change")
+        subjects.append("final human change")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
+        lines = orchestrator.message_body(self.adopt_commits()[0]["message"]).splitlines()
+        self.assertEqual(101, len(lines))
+        self.assertEqual([f"Test {subject}" for subject in subjects], [line.split(" ", 1)[1] for line in lines])
+
+    def test_status_shows_earlier_adoption_while_another_human_commit_is_pending(self):
+        self.after_implement()
+        human = self.human_commit()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
+        self.human_commit("later.txt", "later", "later fix")
+        text = self.status_text()
+        self.assertIn(f"adopted: {human}..{human} (round 2)", text)
+        self.assertIn("next step: blocked", text)
 
     def test_adopt_without_human_commits_changes_nothing(self):
         self.merge_spec()
