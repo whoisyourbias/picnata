@@ -66,7 +66,12 @@ def git(cwd, *args):
 
 
 def run_logged(command, cwd, log, timeout, prompt=None, env=None):
-    executable = shutil.which(command[0])
+    name = command[0]
+    if ("/" in name or "\\" in name) and not Path(name).is_absolute():
+        candidate = Path(cwd) / name
+        executable = str(candidate) if candidate.is_file() else None
+    else:
+        executable = shutil.which(name)
     if executable is None:
         raise FileNotFoundError(f"Executable not found: {command[0]}")
     with log.open("wb") as output:
@@ -81,6 +86,11 @@ def run_logged(command, cwd, log, timeout, prompt=None, env=None):
 
 
 READ_ONLY_PHASES = {"review", "spec"}
+CLAUDE_IMPLEMENT_ALLOWED_TOOLS = [
+    "Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)",
+    "Bash(gradle:*)", "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
+    "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)", "Bash(./backend/gradlew:*)",
+]
 
 
 def run_agent(agent, phase, prompt, cwd, log, timeout):
@@ -97,7 +107,7 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
         else:
             command = [executable, "-p", "--permission-mode", "plan" if read_only else "acceptEdits"]
         if phase == "implement":
-            command += ["--allowedTools", "Bash(python -m unittest:*),Bash(python3 -m unittest:*)"]
+            command += ["--allowedTools", ",".join(CLAUDE_IMPLEMENT_ALLOWED_TOOLS)]
     else:
         mode = "read-only" if read_only else "workspace-write"
         executable = shutil.which("codex") or "codex"
