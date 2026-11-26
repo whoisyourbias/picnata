@@ -287,9 +287,22 @@ python -m harness.orchestrator status add-tests
   Claude 구현자는 `python -m unittest`와 Gradle(`gradle`, `gradlew`, `backend/gradlew` 및 `.bat` 형태) 명령만 실행할 수 있다(review·spec은 읽기 전용).
   Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
   검증 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
-- review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 출력 마지막 줄을
-  `VERDICT: APPROVE` 또는 `VERDICT: REQUEST_CHANGES`로 끝내야 하며, 응답의 마지막 비어 있지 않은 줄만 읽는다. 그 줄이 정확히 두 판정 중 하나가 아니면(본문 중간 인용 포함) `MISSING`으로 기록한다.
-  반려되면 이전 리뷰 커밋의 본문이 다음 implement 프롬프트에 들어간다.
+- review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 지적을 두 심각도로 나눈다.
+  - 차단(Blocking): 근거(파일 위치와 재현 시나리오)가 있고, 명세의 동작 명세·완료 조건 위반, 일반적인 사용 흐름의 잘못된 결과·데이터 손실·크래시,
+    가드·승인·게이트 같은 보안·권한 장치의 우회·약화, 테스트 실패·기존 테스트 파손 중 하나인 지적.
+  - 후속(Follow-up): 그 밖의 모든 지적(명세가 요구하지 않은 드문 경계 상황, 방어 코드, 리팩터링, 이름·문서·스타일, 범위 밖 개선). 확신이 없으면 후속이다.
+- 리뷰 출력은 `## Blocking`과 `## Follow-ups` 두 절을 쓰고(해당 없으면 본문 `None`), 마지막 두 줄을 정확히 다음처럼 끝낸다.
+  ```
+  BLOCKING: <차단 지적 수>
+  VERDICT: <APPROVE|REQUEST_CHANGES>
+  ```
+  하네스는 끝의 빈 줄을 뺀 마지막 줄이 `VERDICT` 줄이고 바로 앞 줄이 `BLOCKING: <0 이상의 정수>`일 때만 판정을 낸다(사이에 빈 줄이 있어도 안 된다).
+  `VERDICT: APPROVE` 한 줄만 쓰거나 형식이 다르면 `MISSING`이다. 판정은 수로 정한다: 0이면 `APPROVE`, 1 이상이면 `REQUEST_CHANGES`.
+  `VERDICT` 줄이 수와 어긋나면 `리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 수를 따릅니다` 경고를 남기고 수를 따른다.
+  review 커밋에는 `Harness-Blocking: <n>`(`MISSING`이면 `?`) 트레일러가 붙는다.
+- 반려되면 이전 리뷰 커밋의 본문이 다음 implement 프롬프트에 들어가고, 구현자는 Blocking 항목만 고치며 후속 과제로 범위를 넓히지 않는다.
+- 후속 과제는 승인을 막지 않는다. 마지막 APPROVE 리뷰의 `## Follow-ups` 절(하위 제목과 코드 블록 포함, 코드 블록 안의 `#` 줄은 제목으로 보지 않는다)이 `None`이 아니면 구현 PR 본문 끝에
+  `## 후속 과제 (리뷰)` 절로 붙으므로, 사람이 PR에서 보고 별도 작업으로 다룰지 정한다.
 - verify는 마지막 APPROVE 리뷰가 본 커밋과 HEAD의 트리가 같을 때만 실행한다. 실패해도 `Harness-Result: fail` 커밋을 남기고 종료 코드 1로 멈춘다.
   원인을 해결한 뒤 `run`을 다시 실행하면 verify부터 이어진다.
 - 각 단계 뒤에 `git push origin harness/<작업 ID>`를 한다. 검증을 통과하면 구현 PR을 연다. 머지는 사람만 하며 하네스는 자동 머지를 켜지 않는다.

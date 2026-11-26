@@ -36,7 +36,10 @@ python -c "from pathlib import Path; assert Path('result.txt').exists()"
 FAKE_GH = """import json, os, sys
 state = os.environ["FAKE_GH_STATE"]
 args = sys.argv[1:]
-sys.stdin.read() if not sys.stdin.isatty() and args[:2] == ["pr", "create"] else None
+body = sys.stdin.buffer.read().decode("utf-8") if args[:2] == ["pr", "create"] else None
+if body is not None:
+    with open(os.path.join(state, "body.md"), "w", encoding="utf-8") as out:
+        out.write(body)
 if args[:1] == ["auth"]:
     sys.exit(0)
 prs = os.path.join(state, "prs.json")
@@ -131,14 +134,93 @@ class SpecParsingTests(unittest.TestCase):
 
 
 class ParseVerdictTests(unittest.TestCase):
-    def test_last_line_decides(self):
-        parse = orchestrator.parse_verdict
-        self.assertEqual("APPROVE", parse("좋습니다.\nVERDICT: APPROVE"))
-        self.assertEqual("APPROVE", parse("좋습니다.\n  VERDICT: APPROVE  \n\n\n"))
-        self.assertEqual("REQUEST_CHANGES", parse("문제\nVERDICT: REQUEST_CHANGES\n"))
-        self.assertEqual("MISSING", parse("VERDICT: APPROVE\n그러나 버그가 있습니다."))
-        self.assertEqual("MISSING", parse("VERDICT: APPROVE please"))
-        self.assertEqual("MISSING", parse(""))
+    def parse(self, text):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = orchestrator.parse_verdict(text)
+        return verdict, stderr.getvalue()
+
+    def test_blocking_count_decides(self):
+        cases = [
+            ("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE", "APPROVE", False),
+            ("좋습니다.\nBLOCKING: 0\nVERDICT: REQUEST_CHANGES", "APPROVE", True),
+            ("문제\nBLOCKING: 2\nVERDICT: APPROVE", "REQUEST_CHANGES", True),
+            ("문제\nBLOCKING: 1\nVERDICT: REQUEST_CHANGES\n", "REQUEST_CHANGES", False),
+            ("좋습니다.\nVERDICT: APPROVE", "MISSING", False),
+            ("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE\n\n\n", "APPROVE", False),
+            ("좋습니다.\r\nBLOCKING: 0\r\nVERDICT: APPROVE\r\n  \r\n", "APPROVE", False),
+            ("좋습니다.\n    BLOCKING: 0\n    VERDICT: APPROVE", "MISSING", False),
+            ("좋습니다.\nBLOCKING: 0  \nVERDICT: APPROVE  ", "MISSING", False),
+            ("BLOCKING: 0\n\nVERDICT: APPROVE", "MISSING", False),
+            ("BLOCKING: 0\n   \nVERDICT: APPROVE\n", "MISSING", False),
+            ("BLOCKING: -1\nVERDICT: APPROVE", "MISSING", False),
+            ("BLOCKING: x\nVERDICT: APPROVE", "MISSING", False),
+            ("BLOCKING: 0\nVERDICT: APPROVE\n그러나 버그가 있습니다.", "MISSING", False),
+            ("BLOCKING: 0\nVERDICT: APPROVE please", "MISSING", False),
+            ("VERDICT: APPROVE\nBLOCKING: 0", "MISSING", False),
+            ("", "MISSING", False),
+        ]
+        for text, expected, warns in cases:
+            with self.subTest(text=text):
+                verdict, stderr = self.parse(text)
+                self.assertEqual(expected, verdict)
+                if warns:
+                    self.assertIn("리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 수를 따릅니다", stderr)
+                else:
+                    self.assertEqual("", stderr)
+
+    def test_follow_ups_section(self):
+        follow = orchestrator.review_follow_ups
+        review = "## Blocking\nNone\n\n## Follow-ups\n- 이름을 바꾸자.\n- 문서를 다듬자.\n\nBLOCKING: 0\nVERDICT: APPROVE"
+        self.assertEqual("- 이름을 바꾸자.\n- 문서를 다듬자.", follow(review))
+        self.assertEqual("", follow("## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("", follow("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("- a", follow("## Follow-ups\n- a\n## Other\n- b"))
+        self.assertEqual("### Documentation\n- Add an example.",
+                         follow("## Follow-ups\n### Documentation\n- Add an example.\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("### A\n- a\n#### A1\n- a1\n### B\n- b",
+                         follow("# Review\n## Blocking\nNone\n## Follow-ups\n### A\n- a\n#### A1\n- a1\n"
+                                "### B\n- b\n# Next\n- c"))
+        self.assertEqual("- a", follow("## Follow-ups\n- a\n# Top\n- b"))
+
+    def test_review_follow_ups_ignores_headings_inside_code_fences(self):
+        follow = orchestrator.review_follow_ups
+        items = ("- Document setup:\n  ```sh\n  # Install dependencies\n  ## not a heading\n  pip install x\n  ```\n"
+                 "- Rename the helper.")
+        self.assertEqual(items, follow(f"## Blocking\nNone\n\n## Follow-ups\n{items}\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        tilde = "~~~\n# comment\n```\n## still code\n~~~\n- b"
+        self.assertEqual(tilde, follow(f"## Follow-ups\n{tilde}\n## Next\n- c"))
+        # A fence in an earlier section does not hide the Follow-ups heading.
+        self.assertEqual("- a", follow("## Blocking\n```\n# x\n```\n## Follow-ups\n- a\nBLOCKING: 0\nVERDICT: APPROVE"))
+
+    def test_review_follow_ups_ignores_headings_inside_indented_code(self):
+        follow = orchestrator.review_follow_ups
+        items = "Document this snippet:\n\n    # sample\n    ## also code\n\trun()\n\n- Rename the helper."
+        self.assertEqual(items, follow(f"## Blocking\nNone\n\n## Follow-ups\n{items}\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        # Up to three spaces of indentation is still a heading.
+        self.assertEqual("- a", follow("## Follow-ups\n- a\n   ## Next\n- b"))
+        # An indented fence marker is code too, so it does not open a fence that swallows the next heading.
+        self.assertEqual("    ```\n- a", follow("## Follow-ups\n    ```\n- a\n## Next\n- b"))
+
+    def test_review_follow_ups_keeps_issue_references(self):
+        follow = orchestrator.review_follow_ups
+        self.assertEqual("#123 tracks the documentation update.",
+                         follow("## Blocking\nNone\n\n## Follow-ups\n#123 tracks the documentation update.\n\n"
+                                "BLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("- a\n#45 is related.\n- b",
+                         follow("## Follow-ups\n- a\n#45 is related.\n- b\n## Next\n- c"))
+        # Closing hashes on a heading are still stripped.
+        self.assertEqual("- a", follow("## Follow-ups ##\n- a\nBLOCKING: 0\nVERDICT: APPROVE"))
+
+class PromptTests(unittest.TestCase):
+    def test_review_prompt_states_severity_and_format(self):
+        text = orchestrator.REVIEW_INSTRUCTIONS
+        for phrase in ("Blocking:", "Follow-up:", "If you are unsure, classify the finding as Follow-up",
+                       "`## Blocking`", "`## Follow-ups`", "`None`",
+                       "BLOCKING: <number of blocking findings>\nVERDICT: <APPROVE|REQUEST_CHANGES>",
+                       "reproduction scenario", "bypasses or weakens", "breaks existing tests",
+                       "concurrent runs or timing races"):
+            self.assertIn(phrase, text)
 
 
 class LockTests(unittest.TestCase):
@@ -306,8 +388,12 @@ class GitFlowTestCase(unittest.TestCase):
                  or c["trailers"].get("Harness-Result")) for c in self.branch_commits()]
 
     def agent(self, verdicts=("APPROVE",), crash_review=False):
-        """A fake agent: implement writes result.txt, review answers from the verdict list."""
+        """A fake agent: implement writes result.txt, review answers from the verdict list.
+
+        A verdict is APPROVE, REQUEST_CHANGES (mapped to BLOCKING 0 / 1) or a full review text."""
         reviews = iter(verdicts)
+        canned = {"APPROVE": "Fix the thing.\nBLOCKING: 0\nVERDICT: APPROVE\n",
+                  "REQUEST_CHANGES": "Fix the thing.\nBLOCKING: 1\nVERDICT: REQUEST_CHANGES\n"}
 
         def run(agent, phase, prompt, cwd, log, timeout):
             self.calls.append((agent, phase, prompt))
@@ -319,7 +405,8 @@ class GitFlowTestCase(unittest.TestCase):
                 return final
             if crash_review:
                 raise ValueError("agent crashed")
-            log.write_text(f"Fix the thing.\nVERDICT: {next(reviews)}\n", encoding="utf-8")
+            review = next(reviews)
+            log.write_text(canned.get(review, review), encoding="utf-8")
         return run
 
 
@@ -410,6 +497,12 @@ class RunTests(GitFlowTestCase):
         self.assertIn("Harness-Command: python -c", commits[4]["message"])
         # The next implement round sees the review findings from the review commit.
         self.assertIn("Previous review findings\nFix the thing.", self.calls[2][2])
+        self.assertIn(orchestrator.IMPLEMENT_SCOPE, self.calls[2][2])
+        self.assertNotIn(orchestrator.IMPLEMENT_SCOPE, self.calls[0][2])
+        self.assertEqual(["1", "0"], [commits[1]["trailers"]["Harness-Blocking"],
+                                      commits[3]["trailers"]["Harness-Blocking"]])
+        self.assertIn(orchestrator.REVIEW_INSTRUCTIONS, self.calls[1][2])
+        self.assertNotIn("후속 과제", (self.gh_state / "body.md").read_text(encoding="utf-8"))
         for commit in commits:
             self.assertEqual("harness", run_git(self.worktree, "log", "-1", "--format=%an", commit["sha"]))
         self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"),
@@ -418,6 +511,42 @@ class RunTests(GitFlowTestCase):
                       (self.gh_state / "calls.log").read_text(encoding="utf-8"))
         self.assertFalse((self.state / "locks" / "demo.json").exists())
         self.assertFalse((self.state / "tasks.sqlite3").exists())
+
+    def test_approved_review_with_follow_ups_reaches_the_pr_body(self):
+        self.merge_spec()
+        review = ("## Blocking\nNone\n\n## Follow-ups\n- 경계 상황을 더 막자.\n\nBLOCKING: 0\nVERDICT: APPROVE\n")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "pass")], self.steps())
+        body = (self.gh_state / "body.md").read_text(encoding="utf-8")
+        self.assertIn("## 후속 과제 (리뷰)\n\n- 경계 상황을 더 막자.", body)
+
+    def test_follow_ups_with_code_fences_reach_the_pr_body_intact(self):
+        self.merge_spec()
+        follow_ups = ("- Document setup:\n  ```sh\n  # Install dependencies\n  pip install -r req.txt\n  ```\n"
+                      "- Rename the helper.")
+        review = f"## Blocking\nNone\n\n## Follow-ups\n{follow_ups}\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        body = (self.gh_state / "body.md").read_text(encoding="utf-8")
+        self.assertIn(f"## 후속 과제 (리뷰)\n\n{follow_ups}", body)
+
+    def test_follow_ups_with_indented_code_reach_the_pr_body_intact(self):
+        self.merge_spec()
+        follow_ups = "Document this snippet:\n\n    # sample\n    run()\n\n- Rename the helper."
+        review = f"## Blocking\nNone\n\n## Follow-ups\n{follow_ups}\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        body = (self.gh_state / "body.md").read_text(encoding="utf-8")
+        self.assertIn(f"## 후속 과제 (리뷰)\n\n{follow_ups}", body)
+
+    def test_missing_blocking_line_records_question_mark(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("VERDICT: APPROVE\n",))):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+        review = self.branch_commits()[1]
+        self.assertEqual(("MISSING", "?"), (review["trailers"]["Harness-Verdict"],
+                                            review["trailers"]["Harness-Blocking"]))
 
     def test_rerun_after_completion_only_opens_the_pr_once(self):
         self.merge_spec()
