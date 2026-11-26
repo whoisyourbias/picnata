@@ -64,11 +64,14 @@ VERDICT_MISMATCH = "경고: 리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 
 
 
 def parse_review(text):
-    """(verdict, blocking count) from the last two non-empty lines: BLOCKING: <n> then VERDICT: <...>.
+    """(verdict, blocking count) from the last two lines after trailing blank lines are removed:
+    BLOCKING: <n> immediately followed by VERDICT: <...>.
 
     The count decides the verdict; a disagreeing VERDICT line only triggers a warning.
     Anything else is ("MISSING", None)."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [line.strip() for line in text.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
     if len(lines) < 2 or lines[-1] not in ("VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES"):
         return "MISSING", None
     match = BLOCKING_LINE.fullmatch(lines[-2])
@@ -88,15 +91,19 @@ def parse_verdict(text):
 
 def review_follow_ups(text):
     """The body of the '## Follow-ups' section of a review, or '' when it is absent or None."""
-    collected, inside = [], False
+    collected, level = [], None
     for line in text.replace("\r", "").splitlines():
         stripped = line.strip()
-        if stripped.startswith("#"):
-            if inside:
+        heading = re.fullmatch(r"(#+)\s*(.*?)\s*#*", stripped) if stripped.startswith("#") else None
+        if heading:
+            depth = len(heading.group(1))
+            if level is not None and depth <= level:
                 break
-            inside = re.fullmatch(r"#+\s*Follow-ups\s*", stripped, re.IGNORECASE) is not None
-            continue
-        if inside:
+            if level is None:
+                if heading.group(2).lower() == "follow-ups":
+                    level = depth
+                continue
+        if level is not None:
             if BLOCKING_LINE.fullmatch(stripped) or stripped.startswith("VERDICT:"):
                 break
             collected.append(line.rstrip())

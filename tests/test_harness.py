@@ -147,7 +147,11 @@ class ParseVerdictTests(unittest.TestCase):
             ("문제\nBLOCKING: 2\nVERDICT: APPROVE", "REQUEST_CHANGES", True),
             ("문제\nBLOCKING: 1\nVERDICT: REQUEST_CHANGES\n", "REQUEST_CHANGES", False),
             ("좋습니다.\nVERDICT: APPROVE", "MISSING", False),
-            ("좋습니다.\n  BLOCKING: 0  \n  VERDICT: APPROVE  \n\n\n", "APPROVE", False),
+            ("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE\n\n\n", "APPROVE", False),
+            ("좋습니다.\r\nBLOCKING: 0\r\nVERDICT: APPROVE\r\n  \r\n", "APPROVE", False),
+            ("좋습니다.\n  BLOCKING: 0  \n  VERDICT: APPROVE  ", "APPROVE", False),
+            ("BLOCKING: 0\n\nVERDICT: APPROVE", "MISSING", False),
+            ("BLOCKING: 0\n   \nVERDICT: APPROVE\n", "MISSING", False),
             ("BLOCKING: -1\nVERDICT: APPROVE", "MISSING", False),
             ("BLOCKING: x\nVERDICT: APPROVE", "MISSING", False),
             ("BLOCKING: 0\nVERDICT: APPROVE\n그러나 버그가 있습니다.", "MISSING", False),
@@ -171,7 +175,12 @@ class ParseVerdictTests(unittest.TestCase):
         self.assertEqual("", follow("## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE"))
         self.assertEqual("", follow("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE"))
         self.assertEqual("- a", follow("## Follow-ups\n- a\n## Other\n- b"))
-
+        self.assertEqual("### Documentation\n- Add an example.",
+                         follow("## Follow-ups\n### Documentation\n- Add an example.\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("### A\n- a\n#### A1\n- a1\n### B\n- b",
+                         follow("# Review\n## Blocking\nNone\n## Follow-ups\n### A\n- a\n#### A1\n- a1\n"
+                                "### B\n- b\n# Next\n- c"))
+        self.assertEqual("- a", follow("## Follow-ups\n- a\n# Top\n- b"))
 
 class PromptTests(unittest.TestCase):
     def test_review_prompt_states_severity_and_format(self):
@@ -464,6 +473,14 @@ class RunTests(GitFlowTestCase):
                                       commits[3]["trailers"]["Harness-Blocking"]])
         self.assertIn(orchestrator.REVIEW_INSTRUCTIONS, self.calls[1][2])
         self.assertNotIn("후속 과제", (self.gh_state / "body.md").read_text(encoding="utf-8"))
+        for commit in commits:
+            self.assertEqual("harness", run_git(self.worktree, "log", "-1", "--format=%an", commit["sha"]))
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"),
+                         run_git(self.origin, "rev-parse", "harness/demo"))
+        self.assertIn("pr create --base main --head harness/demo --title 데모 작업",
+                      (self.gh_state / "calls.log").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "locks" / "demo.json").exists())
+        self.assertFalse((self.state / "tasks.sqlite3").exists())
 
     def test_approved_review_with_follow_ups_reaches_the_pr_body(self):
         self.merge_spec()
@@ -481,14 +498,6 @@ class RunTests(GitFlowTestCase):
         review = self.branch_commits()[1]
         self.assertEqual(("MISSING", "?"), (review["trailers"]["Harness-Verdict"],
                                             review["trailers"]["Harness-Blocking"]))
-        for commit in commits:
-            self.assertEqual("harness", run_git(self.worktree, "log", "-1", "--format=%an", commit["sha"]))
-        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"),
-                         run_git(self.origin, "rev-parse", "harness/demo"))
-        self.assertIn("pr create --base main --head harness/demo --title 데모 작업",
-                      (self.gh_state / "calls.log").read_text(encoding="utf-8"))
-        self.assertFalse((self.state / "locks" / "demo.json").exists())
-        self.assertFalse((self.state / "tasks.sqlite3").exists())
 
     def test_rerun_after_completion_only_opens_the_pr_once(self):
         self.merge_spec()
