@@ -417,6 +417,15 @@ class RelativeExecutableTests(unittest.TestCase):
             self.assertIn("ok", log.read_text())
             with self.assertRaisesRegex(FileNotFoundError, "Executable not found"):
                 orchestrator.run_logged(["tools/missing.sh"], root, log, 60)
+            # A relative cwd must not be resolved twice (once by us, once after the subprocess enters cwd).
+            previous = Path.cwd()
+            os.chdir(root.parent)
+            try:
+                log.unlink()
+                orchestrator.run_logged([name], Path(root.name), log, 60)
+            finally:
+                os.chdir(previous)
+            self.assertIn("ok", log.read_text())
 
 
 class ApprovalTests(unittest.TestCase):

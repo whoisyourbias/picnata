@@ -68,7 +68,7 @@ def git(cwd, *args):
 def run_logged(command, cwd, log, timeout, prompt=None, env=None):
     name = command[0]
     if ("/" in name or "\\" in name) and not Path(name).is_absolute():
-        candidate = Path(cwd) / name
+        candidate = (Path(cwd) / name).absolute()
         executable = str(candidate) if candidate.is_file() else None
     else:
         executable = shutil.which(name)
