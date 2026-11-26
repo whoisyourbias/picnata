@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import orchestrator
+from harness import orchestrator, selection
 
 REPO = Path(__file__).resolve().parents[1]
 IDENT = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false"]
@@ -56,6 +56,116 @@ def run_git(cwd, *args, check=True):
     if check and result.returncode:
         raise AssertionError(result.stderr)
     return result.stdout.strip()
+
+
+class SelectionTests(unittest.TestCase):
+    usage = ("Current session\n88% used\nResets 8pm (Asia/Seoul)\n"
+             "Current week (all models)\n12% used\nResets Dec 1, 8pm (Asia/Seoul)\n")
+
+    def test_claude_windows_ignore_activity_and_reject_unknown_formats(self):
+        now = 1795651200
+        windows = selection.claude_windows(self.usage + "What's contributing to your usage?\n"
+                                            "Current session\n99% used", "sonnet", now)
+        self.assertEqual(12, min(100 - used for used, _ in windows))
+        for bad in (self.usage.split("Current week")[0], self.usage * 2,
+                    self.usage.replace("88%", "101%"), self.usage.replace("8pm", "later")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                selection.claude_windows(bad, "sonnet", now)
+
+    def test_candidate_capability_precedes_quota_and_pair_requires_fresh_observations(self):
+        now = 1000
+        models = [{"model": "gpt-6.2-sol", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]
+        limits = {"rateLimits": {"primary": {"usedPercent": 20, "resetsAt": 2000},
+                                 "secondary": {"usedPercent": 85, "resetsAt": 3000}}}
+        with patch.object(selection, "codex_inventory", return_value=(models, limits)), patch.object(
+                selection.time, "time", return_value=now):
+            codex = selection.candidate("codex", "codex", None, ".", 1, "general")
+            models[0]["supportedReasoningEfforts"] = [{"reasoningEffort": "minimal"}]
+            with self.assertRaises(ValueError):
+                selection.candidate("codex", "codex", None, ".", 1, "general")
+        self.assertEqual(15, codex.remaining)
+        for remaining, age, expected in [(45, 0, "claude"), (15, 0, "codex"), (0, 0, None), (45, 301, None)]:
+            claude = selection.Candidate("claude", "sonnet", "low", remaining, now-age, (2000,))
+            result = selection.choose([codex, claude], "implement", None, now)
+            self.assertEqual(expected, result.agent if result else None)
+
+    def test_effort_policy_and_usage_timeout(self):
+        for text, levels, expected in [
+                ("Reflect decided API fields in documentation", ["low", "high"], "low"),
+                ("API 경계값 테스트", ["minimal", "low", "medium"], "low"),
+                ("설계할 장애 복구 규약", ["low", "high"], "high"),
+                ("문서 설명", [], "default")]:
+            self.assertEqual(expected, selection.effort_for(selection.task_tier(text), levels))
+        self.assertEqual("medium", selection.effort_for("general", ["low", "medium", "high"], True))
+        with tempfile.TemporaryDirectory() as root, patch.object(selection, "candidate",
+                side_effect=subprocess.TimeoutExpired("usage", 1)):
+            log = Path(root) / "selection.log"
+            with self.assertRaisesRegex(ValueError, "codex or claude"):
+                selection.select("implement", "api", root, 1, lambda agent: (agent, None), log)
+            self.assertEqual({"codex", "claude"}, set(json.loads(log.with_suffix(".json").read_text())["unknown"]))
+
+
+    def test_escalation_needs_analysis_and_steps_up_once(self):
+        models = [{"value": "sonnet", "supportedEffortLevels": ["low", "medium", "high"]},
+                  {"value": "opus", "supportedEffortLevels": ["medium", "high"]}]
+        response = subprocess.CompletedProcess([], 0, self.usage)
+        with patch.object(selection, "claude_models", return_value=models), patch.object(
+                selection.subprocess, "run", return_value=response):
+            def attempt(raised):
+                return selection.candidate("claude", "unused", None, ".", 1, "general", raised)
+            self.assertEqual("low", attempt(False).effort)
+            self.assertEqual(("sonnet", "medium"), (attempt(True).model, attempt(True).effort))
+            models[0]["supportedEffortLevels"] = ["low"]
+            self.assertEqual(("opus", "medium"), (attempt(True).model, attempt(True).effort))
+        self.assertTrue(orchestrator.unresolved("UNRESOLVED: duplicate dispatch\nEVIDENCE: race after retry"))
+        self.assertFalse(orchestrator.unresolved("UNRESOLVED: failing assertion"))
+        for reason in ("authentication", "quota exceeded", "environment error"):
+            self.assertFalse(orchestrator.unresolved(f"UNRESOLVED: {reason}\nEVIDENCE: command failed"))
+
+    def test_inapplicable_or_incomplete_model_limits_hold_auto(self):
+        item = {"model": "model", "limitId": "special"}
+        base = {"primary": {"usedPercent": 80, "resetsAt": 1000}}
+        with self.assertRaises(ValueError):
+            selection.codex_windows({"rateLimitsByLimitId": {"codex": base}}, item)
+        with self.assertRaises(ValueError):
+            selection.codex_windows({"rateLimitsByLimitId": {"special": {}, "codex": base}}, item)
+        both = {"codex": base, "special": {"primary": {"usedPercent": 20, "resetsAt": 2000}}}
+        self.assertEqual([(20, 2000), (80, 1000)], selection.codex_windows({"rateLimitsByLimitId": both}, item))
+
+
+    def test_auto_cli_emits_final_response_and_usage_with_configured_effort(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            for agent in ("claude", "codex"):
+                choice = selection.Candidate(agent, "test-model", "medium", 50, 1000, (2000,))
+                log = root / f"{agent}.log"
+                log.touch()
+                log.with_suffix(".json").write_text(json.dumps({"tier": "advanced", "phase": "review",
+                                                    "selected": {"agent": agent}}), encoding="utf-8")
+
+                def cli(command, cwd, log, timeout, prompt, env, stdout_path):
+                    self.assertEqual("test-model", command[command.index("--model") + 1])
+                    usage = {"input_tokens": 100, "output_tokens": 20}
+                    if agent == "claude":
+                        self.assertEqual("medium", command[command.index("--effort") + 1])
+                        stdout_path.write_text(json.dumps({"usage": usage, "result": "final"}), encoding="utf-8")
+                    else:
+                        self.assertIn('model_reasoning_effort="medium"', command)
+                        usage["cached_input_tokens"] = 80
+                        log.write_text(json.dumps({"type": "turn.completed", "usage": usage}), encoding="utf-8")
+                        Path(command[command.index("-o") + 1]).write_text("final", encoding="utf-8")
+
+                with patch.object(orchestrator, "run_logged", side_effect=cli), patch.object(
+                        orchestrator, "agent_runtime", return_value=(agent, None)):
+                    final = orchestrator.run_agent(agent, "review", "review", root, log, 10, choice)
+                self.assertEqual("final", final.read_text(encoding="utf-8"))
+            orchestrator.verification_metrics([], root / "verify-result.log", "pass")
+            summary = json.loads((root / "verify-result.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["first_verification_passed"])
+            for group in summary["local_attempts"]:
+                self.assertEqual(100, group["tokens"]["input_tokens"])
+                self.assertIsNone(group["tokens"]["reasoning_output_tokens"])
+            self.assertEqual(2, len(summary["local_attempts"]))
 
 
 class AgentLaunchTests(unittest.TestCase):
@@ -110,6 +220,10 @@ class ClaudeFinalResponseTests(unittest.TestCase):
 class SpecParsingTests(unittest.TestCase):
     def command(self, section):
         return orchestrator.verify_command(f"# T\n\n## 검증 명령\n{section}\n\n## 가정\n- x\n")[1]
+
+    def test_labelled_inline_verification_command(self):
+        text, args = orchestrator.verify_command("# 작업\n\n## 검증 명령\n회귀 검증: `python -V`")
+        self.assertEqual(("python -V", ["python", "-V"]), (text, args))
 
     def test_command_from_code_block(self):
         self.assertEqual(["python", "-m", "unittest"], self.command("```\npython -m unittest\n```"))
@@ -386,6 +500,28 @@ class RunTests(GitFlowTestCase):
     def test_wait_times_out_with_3(self):
         with patch.object(orchestrator, "WAIT_INTERVAL", 0.05):
             self.assertEqual(3, self.run_cli("--wait", "0.1"))
+
+    def test_auto_resume_pins_reviewer_and_runs_verification_directly(self):
+        self.merge_spec()
+        def quota(agent, *args):
+            now = time.time()
+            return selection.Candidate(agent, "model", "low", 45 if agent == "claude" else 15,
+                                       now, (now + 1000,))
+
+        def execute(agent, phase, prompt, cwd, log, timeout, choice):
+            self.assertEqual(agent, choice.agent)
+            return self.agent()(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(selection, "candidate", side_effect=quota), patch.object(
+                orchestrator, "run_agent", side_effect=execute), patch.object(
+                orchestrator.Task, "review", side_effect=ValueError("interrupted")):
+            self.assertEqual(1, self.cli("run", "demo", "auto"))
+        with patch.object(selection, "candidate", side_effect=quota) as queried, patch.object(
+                orchestrator, "run_agent", side_effect=execute):
+            self.assertEqual(0, self.cli("run", "demo", "auto"), self.stderr)
+            self.assertEqual(["codex"], [call.args[0] for call in queried.call_args_list])
+        self.assertEqual([("claude", "implement"), ("codex", "review")], [c[:2] for c in self.calls])
+        self.assertEqual("low", self.branch_commits()[0]["trailers"]["Harness-Effort"])
 
     def test_full_flow_commits_trailers_and_pushes(self):
         self.merge_spec()
