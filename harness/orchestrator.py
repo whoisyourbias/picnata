@@ -94,6 +94,13 @@ def review_follow_ups(text):
     collected, level, fence = [], None, None
     for line in text.replace("\r", "").splitlines():
         stripped = line.strip()
+        # Four or more columns of indentation make an indented code block line: never a
+        # heading or a fence marker, so '    # sample' stays part of the section.
+        indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+        if indent >= 4 and stripped:
+            if level is not None:
+                collected.append(line.rstrip())
+            continue
         marker = re.match(r"(`{3,}|~{3,})", stripped)
         if fence is not None:
             # Inside a fenced code block: '#' lines are code, not headings.
@@ -122,8 +129,9 @@ def review_follow_ups(text):
             if BLOCKING_LINE.fullmatch(stripped) or stripped.startswith("VERDICT:"):
                 break
             collected.append(line.rstrip())
-    body = "\n".join(collected).strip()
-    return "" if body.rstrip(".").strip().lower() in ("", "none") else body
+    # Trim surrounding blank lines only, so a leading indented code line keeps its indentation.
+    body = "\n".join(collected).strip("\n")
+    return "" if body.strip().rstrip(".").strip().lower() in ("", "none") else body
 
 
 def git(cwd, *args, input=None, env=None, timeout=60):

@@ -193,6 +193,15 @@ class ParseVerdictTests(unittest.TestCase):
         # A fence in an earlier section does not hide the Follow-ups heading.
         self.assertEqual("- a", follow("## Blocking\n```\n# x\n```\n## Follow-ups\n- a\nBLOCKING: 0\nVERDICT: APPROVE"))
 
+    def test_review_follow_ups_ignores_headings_inside_indented_code(self):
+        follow = orchestrator.review_follow_ups
+        items = "Document this snippet:\n\n    # sample\n    ## also code\n\trun()\n\n- Rename the helper."
+        self.assertEqual(items, follow(f"## Blocking\nNone\n\n## Follow-ups\n{items}\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        # Up to three spaces of indentation is still a heading.
+        self.assertEqual("- a", follow("## Follow-ups\n- a\n   ## Next\n- b"))
+        # An indented fence marker is code too, so it does not open a fence that swallows the next heading.
+        self.assertEqual("    ```\n- a", follow("## Follow-ups\n    ```\n- a\n## Next\n- b"))
+
     def test_review_follow_ups_keeps_issue_references(self):
         follow = orchestrator.review_follow_ups
         self.assertEqual("#123 tracks the documentation update.",
@@ -516,6 +525,15 @@ class RunTests(GitFlowTestCase):
         self.merge_spec()
         follow_ups = ("- Document setup:\n  ```sh\n  # Install dependencies\n  pip install -r req.txt\n  ```\n"
                       "- Rename the helper.")
+        review = f"## Blocking\nNone\n\n## Follow-ups\n{follow_ups}\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        body = (self.gh_state / "body.md").read_text(encoding="utf-8")
+        self.assertIn(f"## 후속 과제 (리뷰)\n\n{follow_ups}", body)
+
+    def test_follow_ups_with_indented_code_reach_the_pr_body_intact(self):
+        self.merge_spec()
+        follow_ups = "Document this snippet:\n\n    # sample\n    run()\n\n- Rename the helper."
         review = f"## Blocking\nNone\n\n## Follow-ups\n{follow_ups}\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
         with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
             self.assertEqual(0, self.run_cli(), self.stderr)
