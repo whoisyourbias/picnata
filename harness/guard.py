@@ -111,10 +111,12 @@ def decide_bash(command, env=os.environ):
     """Return None to allow, or a reason string to deny. Best effort: it reads the command text only."""
     if env.get("HARNESS_GUARD") == "off":
         return None
-    if APPROVE_COMMAND.search(command):
-        return "명세 승인(approve)은 사람만 할 수 있습니다. 사용자에게 터미널에서 직접 실행해 달라고 요청하세요."
-    if "tasks.sqlite3" in command:
-        return "하네스 상태 DB는 하네스만 수정할 수 있습니다. 상태는 `orchestrator status <작업 ID>`로 확인하세요."
+    if GH_MERGE.search(command):
+        return "PR 머지는 사람만 할 수 있습니다. 사용자에게 GitHub에서 머지해 달라고 요청하세요."
+    if GH_APPROVE.search(command):
+        return "PR 승인은 사람만 할 수 있습니다."
+    if LOCKS.search(command):
+        return "하네스 잠금 파일(.harness/locks)은 하네스만 수정할 수 있습니다. 상태는 `orchestrator status <작업 ID>`로 확인하세요."
     return None
 
 

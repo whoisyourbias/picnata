@@ -9,6 +9,6 @@ esac
 [ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ] && exit 0
 [ "$HARNESS_GUARD" = "off" ] && exit 0
 echo "하네스 가드: $branch 에 직접 커밋할 수 없습니다." >&2
-echo "  명세를 쓰고 python -m harness.orchestrator run ... 으로 진행한 뒤 harness/<작업 ID> 브랜치를 머지하세요." >&2
+echo "  명세를 쓰고 propose로 명세 PR을 올려 머지한 뒤, python -m harness.orchestrator run <작업 ID> <claude|codex> 로 진행하고 구현 PR을 머지하세요." >&2
 echo "  하네스 자체 유지보수라면 HARNESS_GUARD=off 로 커밋하세요." >&2
 exit 1

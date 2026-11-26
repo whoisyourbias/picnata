@@ -127,9 +127,8 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
             env.pop("CODEX_WINDOWS_REGISTERED_CORE", None)
             env.pop("CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", None)
         command = [executable, "-a", "never", "exec", "-s", mode]
-        if phase == "spec":
-            final = log.with_name(log.stem + "-final.md")
-            command += ["-o", str(final)]
+        final = log.with_name(log.stem + "-final.md")
+        command += ["-o", str(final)]
         command.append("-")
     run_logged(command, cwd, log, timeout, prompt, env=env)
     return final
@@ -519,6 +518,15 @@ def read_text_tail(path):
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 
 
+def final_message(final, log):
+    """The agent's final response: the -o file when it has content, else the captured output."""
+    if final and Path(final) != log:
+        text = read_text_tail(Path(final))
+        if text.strip():
+            return text
+    return read_text_tail(log)
+
+
 def trees_equal(worktree, first, second):
     return git(worktree, "rev-parse", f"{first}^{{tree}}") == git(worktree, "rev-parse", f"{second}^{{tree}}")
 
@@ -546,10 +554,10 @@ class Task:
         if last and last["trailers"].get("Harness-Step") == "review":
             if findings := message_body(last["message"]):
                 prompt += f"\n\nPrevious review findings\n{findings}"
-        run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
+        final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
         git(self.worktree, "add", "-A")
         message = build_message(
-            f"harness({self.id}): implement round {round_number}", read_text_tail(log),
+            f"harness({self.id}): implement round {round_number}", final_message(final, log),
             [("Harness-Task", self.id), ("Harness-Step", "implement"), ("Harness-Agent", self.agent),
              ("Harness-Round", round_number)])
         return harness_commit(self.worktree, message)
@@ -567,11 +575,11 @@ class Task:
             f"Task specification\n{self.spec}\n\nCommit {commit}\n\n{diff}"
         )
         reviewer = OTHER_AGENT[self.agent]
-        run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout)
+        final = run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout)
         ensure_clean(self.worktree)
         if git(self.worktree, "rev-parse", "HEAD") != commit:
             raise ValueError("리뷰하는 동안 작업 커밋이 바뀌었습니다.")
-        output = read_text_tail(log)
+        output = final_message(final, log)
         verdict = review_verdict(output)
         message = build_message(
             f"harness({self.id}): review {verdict}", output,
@@ -660,18 +668,24 @@ def run_task(args, cwd):
         log = task.new_log(step)
         with step_lock(state, args.id, step):
             try:
+                # The plan above was made without the lock; decide again now that we own it.
+                ensure_clean(worktree)
+                commits = read_commits(worktree)
+                if plan_next(commits)[:2] != (step, round_number):
+                    raise ValueError(f"{args.id}: 다른 실행이 단계를 진행했습니다. 다시 run 하세요.")
+                last = plan_next(commits)[2]
                 if step == "implement":
                     sha, result = task.implement(round_number, last, log), None
                 elif step == "review":
                     sha, result = task.review(log)
                 else:
                     sha, result = task.verify(commits, log)
+                print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
+                push_branch(worktree, args.id)
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 with log.open("ab") as output:
                     output.write(f"\n{exc}\n".encode("utf-8"))
                 raise
-        print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
-        push_branch(worktree, args.id)
         if step == "verify" and result != "pass":
             print(f"{args.id}: 검증이 실패했습니다. 로그: {log}. 원인을 해결한 뒤 다시 run 하세요.", file=sys.stderr)
             return 1
@@ -693,12 +707,12 @@ def status(args, cwd):
     remote = git_ok(main_root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}")
     approved = git_ok(main_root, "cat-file", "-e", f"origin/main:docs/tasks/{args.id}.md")
     print(f"task: {args.id}\nspec approved (origin/main): {'yes' if approved else 'no'}")
-    if local:
-        commits = read_commits(main_root, branch)
+    if local or remote:
+        commits = read_commits(main_root, branch if local else f"origin/{branch}")
         step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
         verdict = next((c["trailers"].get("Harness-Verdict") for c in commits
                         if c["trailers"].get("Harness-Step") == "review"), None)
-        pushed = remote and git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}")
+        pushed = remote and (not local or git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}"))
         print(f"next step: {step}\nround: {round_number}\nlast verdict: {verdict or '-'}")
         print(f"branch: {branch}\npushed: {'yes' if pushed else 'no'}")
     else:
