@@ -461,6 +461,23 @@ class ProposeTests(GitFlowTestCase):
         self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
+    def test_locked_local_copy_does_not_fail_successful_propose(self):
+        # On Windows a file can be readable for hashing but locked against deletion.
+        real_unlink = Path.unlink
+
+        def locked_unlink(path, *args, **kwargs):
+            if Path(path) == self.spec_path:
+                raise PermissionError("locked")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", locked_unlink):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertIn("로컬 사본을 지우지 못해 남겨 둡니다", self.stdout)
+        self.assertIn("명세 PR을 머지하면 승인입니다.", self.stdout)
+        self.assertIn("spec/demo", run_git(self.origin, "branch", "--list", "spec/demo"))
+
     def test_local_copy_stays_when_index_cannot_be_read(self):
         # A tracked copy must not be deleted just because git ls-files fails on a corrupt index.
         run_git(self.root, "add", "docs/tasks/demo.md")
@@ -510,6 +527,16 @@ class RunTests(GitFlowTestCase):
         for example in ("python -m unittest discover -s tests", "backend/gradlew.bat -p backend test"):
             self.assertIn(example, prompt)
         self.assertIn("If you could not run the tests", prompt)
+
+    def test_codex_implement_prompt_has_no_claude_command_guide(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        prompt = next(prompt for agent, phase, prompt in self.calls
+                      if agent == "codex" and phase == "implement")
+        self.assertNotIn(orchestrator.IMPLEMENT_COMMAND_GUIDE, prompt)
+        self.assertNotIn("single command", prompt)
+        self.assertIn("Task specification\n", prompt)
 
     def test_wait_times_out_with_3(self):
         with patch.object(orchestrator, "WAIT_INTERVAL", 0.05):

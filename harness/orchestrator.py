@@ -610,7 +610,13 @@ def remove_pushed_copy(main_root, task_path, blob):
             return False
     except (ValueError, OSError, subprocess.SubprocessError):
         return False
-    target.unlink()
+    try:
+        target.unlink()
+    except OSError as exc:
+        # The proposal already succeeded; a file locked against deletion (common on Windows) only
+        # means the local copy stays, so report it instead of failing propose.
+        print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
+        return False
     return True
 
 
@@ -721,11 +727,13 @@ class Task:
         return log
 
     def implement(self, round_number, last, log):
+        # The command guide describes Claude's tool permissions; Codex runs under its own sandbox.
+        guide = f"{IMPLEMENT_COMMAND_GUIDE}\n\n" if self.agent == "claude" else ""
         prompt = (
             "Implement the task in this worktree. Read the applicable project instructions. "
             "Stay on the assigned branch and keep changes local. The harness commits your changes; "
             "do not run git commit. Report the changes and checks.\n\n"
-            f"{IMPLEMENT_COMMAND_GUIDE}\n\n"
+            f"{guide}"
             f"Task specification\n{self.spec}"
         )
         if last and last["trailers"].get("Harness-Step") == "review":

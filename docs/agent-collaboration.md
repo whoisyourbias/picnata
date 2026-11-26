@@ -278,6 +278,7 @@ python -m harness.orchestrator status add-tests
   main 체크아웃의 브랜치·인덱스는 바꾸지 않는다. push와 PR 생성이 성공하고 main 체크아웃의 명세가 git에서 추적되지 않는 파일이며
   내용이 push한 것과 같으면, 머지 뒤 `git pull`을 막지 않도록 그 로컬 사본을 지운다. 추적 중이거나 내용이 다르거나 push·PR 생성이 실패하면 남긴다.
   `git ls-files`가 실패하는 등 추적 여부를 git으로 확인하지 못해도 남긴다.
+  파일이 잠겨 지우지 못하면(Windows) 남겨 두었다고 출력하고, 이미 성공한 `propose`는 실패로 바꾸지 않는다.
   머지 전에 명세를 고치려면 `git show origin/spec/<작업 ID>:docs/tasks/<작업 ID>.md > docs/tasks/<작업 ID>.md`로 되살려 고친 뒤 다시 `propose`하면 `spec/<작업 ID>`가 갱신된다.
   Windows PowerShell 5.1의 `>`는 UTF-16으로 저장하므로, 그 환경에서는 `git restore --source=origin/spec/<작업 ID> --worktree -- docs/tasks/<작업 ID>.md`로 되살린다(인덱스는 바꾸지 않는다).
   `gh`가 없거나 인증되지 않았으면 push까지 하고 수동 PR URL을 안내한다(로컬 사본은 남는다).
@@ -290,7 +291,7 @@ python -m harness.orchestrator status add-tests
   verify는 검증 명령 출력의 마지막 100줄을 본문(최대 8000자)에 남긴다. 에이전트 원본 로그는 `.harness/logs/<작업 ID>/`(로컬)에만 있다.
   Claude 구현자는 `python -m unittest`와 Gradle(`gradle`, `gradlew`, `backend/gradlew` 및 `.bat` 형태) 명령만 실행할 수 있다(review·spec은 읽기 전용).
   허용 규칙은 하나의 명령 접두어 목록(`IMPLEMENT_COMMAND_PREFIXES`)에서 Bash와 PowerShell 도구 양쪽으로 만들고, PowerShell에는
-  `.\gradlew.bat`, `.\backend\gradlew.bat`, `backend\gradlew.bat`를 더 허용한다. implement 프롬프트는 이 접두어로 시작하는 단일 명령을
+  `.\gradlew.bat`, `.\backend\gradlew.bat`, `backend\gradlew.bat`를 더 허용한다. Claude implement 프롬프트는 이 접두어로 시작하는 단일 명령을
   worktree 루트에서 실행하라고 안내한다. `cd`, `&&`, `;`, `|`, 리디렉션, 임시 스크립트는 승인이 필요해 거부되며,
   테스트를 못 돌렸으면 최종 응답에 그 사실과 이유를 쓰게 한다.
   프롬프트는 이 명령을 Bash 도구로 먼저 실행하고, 한 도구가 거부하면 다른 도구로 같은 명령을 다시 시도하라고 안내한다.
@@ -300,6 +301,7 @@ python -m harness.orchestrator status add-tests
   `backend/gradlew.bat --version`, `.\backend\gradlew.bat --version`을 모두 "contains multiple operations"로 거부했다.
   단일 명령도 거부되므로 규칙이 적용되기 전에 Claude Code의 PowerShell 명령 분석 단계에서 막히는 것으로 보이며, 하네스 쪽 규칙으로는 풀 수 없다.
   PowerShell 규칙은 이 분석이 고쳐지면 바로 쓰이도록 남겨 두고, 지금은 Bash 도구가 실제 실행 경로다.
+  이 안내는 Claude의 도구 권한에 관한 것이므로 Codex 구현자 프롬프트에는 넣지 않는다.
   Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
   검증 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
 - review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 출력 마지막 줄을
