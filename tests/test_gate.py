@@ -74,13 +74,20 @@ class GateTests(unittest.TestCase):
         self.assertEqual([], self.check("spec/demo", base))
 
     def test_spec_branch_fails_when_base_already_has_the_spec(self):
+        # spec/demo and main both add the spec independently from a common ancestor, so the
+        # branch diff (merge-base...head) is a single addition and only the base check can catch it.
+        run_git(self.root, "checkout", "-q", "-b", "spec/demo")
+        self.write("docs/tasks/demo.md", "# spec again\n")
+        run_git(self.root, *IDENT, "commit", "-m", "spec again")
+        run_git(self.root, "checkout", "-q", "main")
         self.write("docs/tasks/demo.md", "# approved\n")
         run_git(self.root, *IDENT, "commit", "-m", "approved spec")
         base = self.sha()
-        run_git(self.root, "checkout", "-q", "-b", "spec/demo")
-        self.write("docs/tasks/demo.md", "# changed\n")
-        run_git(self.root, *IDENT, "commit", "-m", "spec again")
-        self.assertTrue(self.check("spec/demo", base))
+        run_git(self.root, "checkout", "-q", "spec/demo")
+        self.assertEqual("A\tdocs/tasks/demo.md",
+                         run_git(self.root, "diff", "--name-status", f"{base}...HEAD"))
+        errors = self.check("spec/demo", base)
+        self.assertTrue(any("이미 승인된 명세입니다" in error for error in errors), errors)
 
     def test_spec_branch_with_other_files_fails(self):
         base = self.sha()

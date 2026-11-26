@@ -430,6 +430,26 @@ def step_lock(state, task_id, step):
             pass
 
 
+def set_lock_step(path, step):
+    """Name the step in a lock file this process owns. The file is replaced atomically so readers
+    (the guard, other runners) never see a torn file and never think the lock is free."""
+    info = read_lock(path)
+    if not isinstance(info, dict) or info.get("pid") != os.getpid():
+        raise ValueError(f"잠금 파일 {path}를 이 실행이 갖고 있지 않습니다.")
+    info["step"] = step
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(info), encoding="utf-8")
+    for attempt in range(50):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:  # Windows: a reader has the file open for a moment.
+            if attempt == 49:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(0.02)
+
+
 # ---- GitHub CLI --------------------------------------------------------------------------------
 
 
@@ -771,35 +791,32 @@ def run_task(args, cwd):
     task = Task(args, main_root, state, worktree, spec_path, spec, command_text, command)
     implements = 0
     while True:
-        # A running step may be editing the worktree; report that before complaining about its changes.
-        if (error := lock_busy_error(state / "locks" / f"{args.id}.json", args.id)) is not None:
-            raise error
-        ensure_clean(worktree)
-        sync_remote(worktree, args.id)
-        commits = read_commits(worktree, merged_task=args.id)
-        step, round_number, last = plan_next(commits)
-        if step == "done":
-            print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
-            return task.finish(commits)
-        if step == "implement":
-            if implements >= args.max_rounds:
-                print(f"{args.id}: reviewer still requests changes after {implements} implement run(s). "
-                      f"{state / 'logs' / args.id}의 로그와 리뷰 커밋을 읽은 뒤 다시 run 하세요.", file=sys.stderr)
-                return 1
-            implements += 1
-        log = task.new_log(step)
-        with step_lock(state, args.id, step):
+        # Take the task lock before anything can move HEAD: syncing with origin, pushing and planning
+        # all happen under it, so no other runner can start a step on a plan made from stale state.
+        # A live lock is reported before any complaint about the worktree's changes.
+        log = None
+        with step_lock(state, args.id, "plan") as lock:
             try:
-                # Publish a stage commit left behind by an earlier push failure before doing more work.
+                ensure_clean(worktree)
                 sync_remote(worktree, args.id)
+                # Plan first: plan_next rejects commits without trailers before anything is pushed.
+                commits = read_commits(worktree, merged_task=args.id)
+                step, round_number, last = plan_next(commits)
+                if step == "done":
+                    print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
+                    return task.finish(commits)
+                if step == "implement":
+                    if implements >= args.max_rounds:
+                        print(f"{args.id}: reviewer still requests changes after {implements} implement run(s). "
+                              f"{state / 'logs' / args.id}의 로그와 리뷰 커밋을 읽은 뒤 다시 run 하세요.",
+                              file=sys.stderr)
+                        return 1
+                    implements += 1
+                # Publish a stage commit left behind by an earlier push failure before doing more work.
                 if pending_push(worktree, args.id):
                     push_branch(worktree, args.id)
-                # The plan above was made without the lock; decide again now that we own it.
-                ensure_clean(worktree)
-                commits = read_commits(worktree, merged_task=args.id)
-                if plan_next(commits)[:2] != (step, round_number):
-                    raise ValueError(f"{args.id}: 다른 실행이 단계를 진행했습니다. 다시 run 하세요.")
-                last = plan_next(commits)[2]
+                log = task.new_log(step)
+                set_lock_step(lock, step)
                 if step == "implement":
                     sha, result = task.implement(round_number, last, log), None
                 elif step == "review":
@@ -809,8 +826,9 @@ def run_task(args, cwd):
                 print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
                 push_branch(worktree, args.id)
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                with log.open("ab") as output:
-                    output.write(f"\n{exc}\n".encode("utf-8"))
+                if log is not None:
+                    with log.open("ab") as output:
+                        output.write(f"\n{exc}\n".encode("utf-8"))
                 raise
         if step == "verify" and result != "pass":
             print(f"{args.id}: 검증이 실패했습니다. 로그: {log}. 원인을 해결한 뒤 다시 run 하세요.", file=sys.stderr)

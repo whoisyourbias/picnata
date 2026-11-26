@@ -141,9 +141,9 @@ class HookCommandTests(unittest.TestCase):
         (self.worktree / "harness").mkdir()
         (self.worktree / "harness" / "guard.py").write_text(self.ALLOW_ALL, encoding="utf-8")
 
-    def hook(self, project_dir):
+    def hook(self, project_dir, target=None):
         event = {"tool_name": "Write", "cwd": str(project_dir),
-                 "tool_input": {"file_path": str(self.root / "main.py")}}
+                 "tool_input": {"file_path": str(target or self.root / "main.py")}}
         env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project_dir)}
         env.pop("HARNESS_GUARD", None)
         return subprocess.run(["sh", "-c", self.command], input=json.dumps(event), env=env,
@@ -153,6 +153,10 @@ class HookCommandTests(unittest.TestCase):
         (self.root / "harness").mkdir()
         shutil.copy(guard.__file__, self.root / "harness" / "guard.py")
         self.assertEqual(2, self.hook(self.worktree))
+        # The main guard really decides: what it allows passes, from the worktree and from main.
+        spec = self.root / "docs" / "tasks" / "a.md"
+        self.assertEqual(0, self.hook(self.worktree, spec))
+        self.assertEqual(0, self.hook(self.root, spec))
 
     def test_missing_main_guard_denies(self):
         self.assertEqual(2, self.hook(self.worktree))
