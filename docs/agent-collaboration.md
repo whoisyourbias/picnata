@@ -276,7 +276,7 @@ python -m harness.orchestrator status add-tests
 
 - `propose`는 main 체크아웃의 명세(커밋 안 된 파일 가능)를 읽는다. "열린 질문" 절이 정확히 `없음`이 아니면 거부한다.
   main 체크아웃의 브랜치·인덱스는 바꾸지 않는다. push와 PR 생성이 성공하고 main 체크아웃의 명세가 git에서 추적되지 않는 파일이며
-  내용이 push한 것과 같으면, 머지 뒤 `git pull`을 막지 않도록 그 로컬 사본을 지운다. 추적 중이거나 내용이 다르거나 push·PR 생성이 실패하면 남긴다.
+  내용이 push한 것과 같으면, 머지 뒤 `git pull`을 막지 않도록 그 로컬 사본을 지운다. 추적 중이거나 내용이 다르거나 push·PR 생성이 실패하면 남긴다. 비교 전에 파일을 같은 폴더의 임시 이름으로 옮겨 확인한 바이트만 지우므로, 그 사이 편집기가 원래 경로에 새로 저장한 파일은 지우지 않는다.
   `git ls-files`가 실패하는 등 추적 여부를 git으로 확인하지 못해도 남긴다.
   파일이 잠겨 지우지 못하면(Windows) 남겨 두었다고 출력하고, 이미 성공한 `propose`는 실패로 바꾸지 않는다.
   머지 전에 명세를 고치려면 `git show origin/spec/<작업 ID>:docs/tasks/<작업 ID>.md > docs/tasks/<작업 ID>.md`로 되살려 고친 뒤 다시 `propose`하면 `spec/<작업 ID>`가 갱신된다.

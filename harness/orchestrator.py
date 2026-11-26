@@ -606,18 +606,59 @@ def remove_pushed_copy(main_root, task_path, blob):
         # (or any other git failure) leaves the file alone.
         if git(main_root, "ls-files", "--", task_path).strip():
             return False
-        if git(main_root, "hash-object", "--", str(target)) != blob:
-            return False
     except (ValueError, OSError, subprocess.SubprocessError):
         return False
+    # Move the copy aside before hashing it, so the bytes that are verified are exactly the bytes
+    # that get deleted. Anything an editor saves at the original path meanwhile is left untouched.
+    candidate = target.with_name(f".{target.name}.{uuid4().hex}.propose")
     try:
-        target.unlink()
+        target.rename(candidate)
     except OSError as exc:
-        # The proposal already succeeded; a file locked against deletion (common on Windows) only
-        # means the local copy stays, so report it instead of failing propose.
+        # The proposal already succeeded; a file locked against moving or deletion (common on
+        # Windows) only means the local copy stays, so report it instead of failing propose.
         print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
         return False
-    return True
+    try:
+        matches = git(main_root, "hash-object", "--", str(candidate)) == blob
+    except (ValueError, OSError, subprocess.SubprocessError):
+        matches = False
+    if matches:
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
+        else:
+            if not target.exists():
+                return True
+            # The old copy is gone, but a newer file was saved at the path; keep it and do not
+            # suggest a recovery command that would overwrite it.
+            print(f"push한 로컬 사본은 지웠고, 그 뒤 새로 저장된 {target}는 남겨 둡니다.")
+            return False
+    restore_candidate(candidate, target)
+    return False
+
+
+def restore_candidate(candidate, target):
+    """Put a moved-aside copy back at target without overwriting a file saved there in the meantime."""
+    try:
+        os.link(candidate, target)  # fails if target exists, on every platform
+    except FileExistsError:
+        print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
+        return
+    except OSError:
+        # No hard links on this file system; fall back to a rename guarded by an existence check.
+        try:
+            if target.exists():
+                print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
+            else:
+                candidate.rename(target)
+        except OSError as exc:
+            print(f"로컬 사본을 {candidate}에서 되돌리지 못했습니다: {exc}")
+        return
+    try:
+        candidate.unlink()
+    except OSError as exc:
+        print(f"임시 사본 {candidate}를 지우지 못했습니다: {exc}")
 
 
 # ---- run ---------------------------------------------------------------------------------------

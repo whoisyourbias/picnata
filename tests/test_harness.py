@@ -451,8 +451,28 @@ class ProposeTests(GitFlowTestCase):
 
         with patch.object(orchestrator, "open_pr", side_effect=edit_then_open):
             self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
-        self.assertTrue(self.spec_path.exists())
+        self.assertEqual(SPEC + "\n추가 메모\n", self.spec_path.read_text(encoding="utf-8"))
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+
+    def test_replacement_saved_after_hashing_survives(self):
+        # An editor saves new content right after the cleanup hashed the old copy; only the
+        # verified old bytes may be deleted.
+        real_git = orchestrator.git
+        replacement = SPEC + "\n나중에 저장한 수정\n"
+
+        def git_then_save(cwd, *args, **kwargs):
+            result = real_git(cwd, *args, **kwargs)
+            if args and args[0] == "hash-object" and "-w" not in args:
+                self.spec_path.write_text(replacement, encoding="utf-8")
+            return result
+
+        with patch.object(orchestrator, "git", side_effect=git_then_save):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(replacement, self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertIn("새로 저장된", self.stdout)
 
     def test_tracked_local_copy_stays(self):
         # Tracked locally (for example staged) but not on origin/main yet.
@@ -463,20 +483,34 @@ class ProposeTests(GitFlowTestCase):
 
     def test_locked_local_copy_does_not_fail_successful_propose(self):
         # On Windows a file can be readable for hashing but locked against deletion.
-        real_unlink = Path.unlink
+        real_rename = Path.rename
 
-        def locked_unlink(path, *args, **kwargs):
+        def locked_rename(path, *args, **kwargs):
             if Path(path) == self.spec_path:
                 raise PermissionError("locked")
-            return real_unlink(path, *args, **kwargs)
+            return real_rename(path, *args, **kwargs)
 
-        with patch.object(Path, "unlink", locked_unlink):
+        with patch.object(Path, "rename", locked_rename):
             self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
         self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
         self.assertIn("로컬 사본을 지우지 못해 남겨 둡니다", self.stdout)
         self.assertIn("명세 PR을 머지하면 승인입니다.", self.stdout)
         self.assertIn("spec/demo", run_git(self.origin, "branch", "--list", "spec/demo"))
+
+    def test_undeletable_moved_copy_is_restored(self):
+        real_unlink = Path.unlink
+
+        def locked_unlink(path, *args, **kwargs):
+            if Path(path).name.endswith(".propose"):
+                raise PermissionError("locked")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", locked_unlink):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertIn("로컬 사본을 지우지 못해 남겨 둡니다", self.stdout)
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
     def test_local_copy_stays_when_index_cannot_be_read(self):
         # A tracked copy must not be deleted just because git ls-files fails on a corrupt index.
