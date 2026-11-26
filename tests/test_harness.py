@@ -459,6 +459,45 @@ class RunTests(GitFlowTestCase):
             agent.assert_not_called()
         self.assertIn("다른 실행이 단계를 진행했습니다", self.stderr)
 
+    def test_raw_log_is_never_committed_when_final_response_is_missing(self):
+        self.merge_spec()
+
+        def agent(name, phase, prompt, cwd, log, timeout):
+            log.write_text("SECRET-RAW-LOG\n", encoding="utf-8")
+            (Path(cwd) / "result.txt").write_text("x", encoding="utf-8")
+            final = log.with_name(log.stem + "-final.md")
+            final.write_text("", encoding="utf-8")
+            if phase == "implement":
+                return final
+            raise ValueError("stop after implement")
+
+        with patch.object(orchestrator, "run_agent", side_effect=agent):
+            self.assertEqual(1, self.run_cli())
+        self.assertNotIn("SECRET-RAW-LOG", run_git(self.worktree, "log", "--format=%B", "origin/main..HEAD"))
+        self.assertNotIn("SECRET-RAW-LOG", run_git(self.origin, "log", "--format=%B", "harness/demo"))
+
+    def test_pending_commit_is_pushed_before_the_next_phase(self):
+        self.merge_spec()
+        real_push = orchestrator.push_branch
+
+        def failing_push(worktree, task_id):
+            raise ValueError("push 실패 (커밋은 로컬에 남았습니다): offline")
+
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                patch.object(orchestrator, "push_branch", failing_push):
+            self.assertEqual(1, self.run_cli())
+        self.assertEqual([("implement", None)], self.steps())
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent, \
+                patch.object(orchestrator, "push_branch", failing_push):
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        # Once the remote is back, the pending commit is published and the run continues.
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                patch.object(orchestrator, "push_branch", real_push):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+
     def test_status_reads_stage_from_git(self):
         self.merge_spec()
         with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):

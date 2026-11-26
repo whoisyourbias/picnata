@@ -558,13 +558,26 @@ def read_text_tail(path):
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 
 
+NO_FINAL_MESSAGE = "(에이전트 최종 응답이 없습니다. 원본 로그는 로컬에만 있습니다.)"
+
+
 def final_message(final, log):
-    """The agent's final response: the -o file when it has content, else the captured output."""
+    """The agent's final response. A separate -o file is required to have content; the raw log is
+    never used as a fallback because it is not committed or pushed."""
     if final and Path(final) != log:
         text = read_text_tail(Path(final))
-        if text.strip():
-            return text
+        return text if text.strip() else ""
     return read_text_tail(log)
+
+
+def pending_push(worktree, task_id):
+    """True when harness commits exist locally that origin/harness/<id> does not contain."""
+    branch = f"harness/{task_id}"
+    if not read_commits(worktree):
+        return False
+    if not git_ok(worktree, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
+        return True
+    return not git_ok(worktree, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
 
 
 def trees_equal(worktree, first, second):
@@ -597,7 +610,8 @@ class Task:
         final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
         git(self.worktree, "add", "-A")
         message = build_message(
-            f"harness({self.id}): implement round {round_number}", final_message(final, log),
+            f"harness({self.id}): implement round {round_number}",
+            final_message(final, log) or NO_FINAL_MESSAGE,
             [("Harness-Task", self.id), ("Harness-Step", "implement"), ("Harness-Agent", self.agent),
              ("Harness-Round", round_number)])
         return harness_commit(self.worktree, message)
@@ -709,6 +723,9 @@ def run_task(args, cwd):
         log = task.new_log(step)
         with step_lock(state, args.id, step):
             try:
+                # Publish a stage commit left behind by an earlier push failure before doing more work.
+                if pending_push(worktree, args.id):
+                    push_branch(worktree, args.id)
                 # The plan above was made without the lock; decide again now that we own it.
                 ensure_clean(worktree)
                 commits = read_commits(worktree)
