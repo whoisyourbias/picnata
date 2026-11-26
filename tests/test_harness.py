@@ -89,6 +89,65 @@ class AgentLaunchTests(unittest.TestCase):
                 self.assertEqual("1", os.environ["CODEX_WINDOWS_REGISTERED_CORE"])
 
 
+BASH_RULES = [
+    "Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)",
+    "Bash(gradle:*)", "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
+    "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)", "Bash(./backend/gradlew:*)",
+]
+POWERSHELL_ONLY = [r".\gradlew.bat", r".\backend\gradlew.bat", r"backend\gradlew.bat"]
+
+
+class AgentPermissionTests(unittest.TestCase):
+    def command(self, agent, phase):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.dict(os.environ, {"CODEX_WINDOWS_REGISTERED_CORE": ""}),
+                patch.object(orchestrator.shutil, "which", side_effect=lambda name: name),
+                patch.object(orchestrator, "run_logged") as run,
+            ):
+                orchestrator.run_agent(agent, phase, "Go", root, root / f"{phase}.log", 60)
+            command = run.call_args.args[0]
+            # Normalise the temporary output path so commands compare across calls.
+            return [part.replace(str(root), "<tmp>") for part in command]
+
+    @staticmethod
+    def rules(command):
+        return command[command.index("--allowedTools") + 1].split(",")
+
+    def test_claude_implement_allows_bash_and_powershell_rules(self):
+        rules = self.rules(self.command("claude", "implement"))
+        powershell = [rule.replace("Bash(", "PowerShell(", 1) for rule in BASH_RULES]
+        powershell += [f"PowerShell({prefix}:*)" for prefix in POWERSHELL_ONLY]
+        self.assertEqual(9, len(BASH_RULES))
+        self.assertEqual(12, len(powershell))
+        for rule in BASH_RULES + powershell:
+            self.assertIn(rule, rules)
+        self.assertEqual(21, len(rules))
+
+    def test_bash_and_powershell_rules_share_one_prefix_list(self):
+        rules = orchestrator.CLAUDE_IMPLEMENT_ALLOWED_TOOLS
+        prefix = re.compile(r"^(Bash|PowerShell)\((.*):\*\)$")
+        parsed = [prefix.match(rule).groups() for rule in rules]
+        bash = {p for tool, p in parsed if tool == "Bash"}
+        powershell = {p for tool, p in parsed if tool == "PowerShell"}
+        self.assertEqual(set(POWERSHELL_ONLY), powershell - bash)
+        self.assertEqual(bash, powershell - set(POWERSHELL_ONLY))
+        self.assertEqual(set(orchestrator.IMPLEMENT_COMMAND_PREFIXES), bash)
+
+    def test_other_commands_are_unchanged(self):
+        self.assertEqual(["claude", "-p", "--permission-mode", "plan"], self.command("claude", "review"))
+        self.assertEqual(["claude", "-p", "--permission-mode", "default",
+                          "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"],
+                         self.command("claude", "spec"))
+        self.assertEqual(["codex", "-a", "never", "exec", "-s", "workspace-write",
+                          "-o", str(Path("<tmp>") / "implement-final.md"), "-"],
+                         self.command("codex", "implement"))
+        self.assertEqual(["codex", "-a", "never", "exec", "-s", "read-only",
+                          "-o", str(Path("<tmp>") / "review-final.md"), "-"],
+                         self.command("codex", "review"))
+
+
 class ClaudeFinalResponseTests(unittest.TestCase):
     def test_claude_stdout_is_captured_apart_from_stderr(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -374,10 +433,10 @@ class GitFlowTestCase(unittest.TestCase):
         run_git(self.root, "push", "origin", "main")
 
     def cli(self, *args):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
             code = orchestrator.main(list(args), cwd=self.root)
-        self.stderr = stderr.getvalue()
+        self.stderr, self.stdout = stderr.getvalue(), stdout.getvalue()
         return code
 
     def branch_commits(self):
@@ -424,14 +483,26 @@ class ProposeTests(GitFlowTestCase):
         self.assertEqual(1, self.cli("propose", "demo"))
 
     def test_propose_pushes_one_file_on_top_of_origin_main(self):
-        before = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "status", "--porcelain"),
-                  run_git(self.root, "ls-files"), run_git(self.root, "symbolic-ref", "HEAD"),
-                  self.spec_path.read_text(encoding="utf-8"))
+        before = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "ls-files"),
+                  run_git(self.root, "symbolic-ref", "HEAD"))
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
-        after = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "status", "--porcelain"),
-                 run_git(self.root, "ls-files"), run_git(self.root, "symbolic-ref", "HEAD"),
-                 self.spec_path.read_text(encoding="utf-8"))
+        after = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "ls-files"),
+                 run_git(self.root, "symbolic-ref", "HEAD"))
         self.assertEqual(before, after)
+        # The untracked local copy matched the pushed blob, so it is gone and the checkout is clean.
+        self.assertFalse(self.spec_path.exists())
+        self.assertEqual("", run_git(self.root, "status", "--porcelain"))
+        self.assertIn("로컬 사본을 지웠습니다. 수정하려면: git show origin/spec/demo:docs/tasks/demo.md "
+                      "> docs/tasks/demo.md", self.stdout)
+        restore = "git restore --source=origin/spec/demo --worktree -- docs/tasks/demo.md"
+        self.assertIn(restore, self.stdout)
+        # The Windows-safe recovery command brings back the exact UTF-8 bytes without staging them.
+        run_git(self.root, *restore.split()[1:])
+        self.assertEqual(SPEC.encode("utf-8"), self.spec_path.read_bytes().replace(b"\r\n", b"\n"))
+        self.assertEqual("?? docs/tasks/demo.md",
+                         run_git(self.root, "status", "--porcelain", "--untracked-files=all"))
+        self.spec_path.unlink()
+        self.assertEqual(SPEC, run_git(self.root, "show", "origin/spec/demo:docs/tasks/demo.md") + "\n")
         main = run_git(self.origin, "rev-parse", "main")
         self.assertEqual(main, run_git(self.origin, "rev-parse", "spec/demo^"))
         self.assertEqual("docs/tasks/demo.md", run_git(self.origin, "diff", "--name-only", main, "spec/demo"))
@@ -443,9 +514,208 @@ class ProposeTests(GitFlowTestCase):
 
     def test_existing_pr_is_not_duplicated(self):
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.set_spec(SPEC)
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
         calls = (self.gh_state / "calls.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(1, len(calls))
+
+    def test_local_copy_stays_when_pr_creation_fails(self):
+        with patch.object(orchestrator, "gh_available", return_value=None):
+            self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+
+    def test_local_copy_stays_when_push_fails(self):
+        run_git(self.root, "remote", "set-url", "--push", "origin", str(self.root.parent / "missing.git"))
+        self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+
+    def test_local_copy_stays_when_content_differs(self):
+        real_open_pr = orchestrator.open_pr
+
+        def edit_then_open(*args, **kwargs):
+            self.spec_path.write_text(SPEC + "\n추가 메모\n", encoding="utf-8")
+            return real_open_pr(*args, **kwargs)
+
+        with patch.object(orchestrator, "open_pr", side_effect=edit_then_open):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC + "\n추가 메모\n", self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+
+    def test_replacement_saved_after_hashing_survives(self):
+        # An editor saves new content right after the cleanup hashed the old copy; only the
+        # verified old bytes may be deleted.
+        real_git = orchestrator.git
+        replacement = SPEC + "\n나중에 저장한 수정\n"
+
+        def git_then_save(cwd, *args, **kwargs):
+            result = real_git(cwd, *args, **kwargs)
+            if args and args[0] == "hash-object" and "-w" not in args:
+                self.spec_path.write_text(replacement, encoding="utf-8")
+            return result
+
+        with patch.object(orchestrator, "git", side_effect=git_then_save):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(replacement, self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertIn("새로 저장된", self.stdout)
+
+    def test_tracked_local_copy_stays(self):
+        # Tracked locally (for example staged) but not on origin/main yet.
+        run_git(self.root, "add", "docs/tasks/demo.md")
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_copy_staged_just_before_rename_stays(self):
+        # The user stages the spec after the first ls-files check but before the copy is moved aside;
+        # the cleanup must notice and put the copy back instead of leaving a staged add + deletion.
+        real_rename = Path.rename
+
+        def stage_then_rename(path, *args, **kwargs):
+            if Path(path) == self.spec_path:
+                run_git(self.root, "add", "docs/tasks/demo.md")
+            return real_rename(path, *args, **kwargs)
+
+        with patch.object(Path, "rename", stage_then_rename):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual("A  docs/tasks/demo.md", run_git(self.root, "status", "--porcelain"))
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_locked_local_copy_does_not_fail_successful_propose(self):
+        # On Windows a file can be readable for hashing but locked against deletion.
+        real_rename = Path.rename
+
+        def locked_rename(path, *args, **kwargs):
+            if Path(path) == self.spec_path:
+                raise PermissionError("locked")
+            return real_rename(path, *args, **kwargs)
+
+        with patch.object(Path, "rename", locked_rename):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertIn("로컬 사본을 지우지 못해 남겨 둡니다", self.stdout)
+        self.assertIn("명세 PR을 머지하면 승인입니다.", self.stdout)
+        self.assertIn("spec/demo", run_git(self.origin, "branch", "--list", "spec/demo"))
+
+    def test_undeletable_moved_copy_is_restored(self):
+        real_unlink = Path.unlink
+
+        def locked_unlink(path, *args, **kwargs):
+            if Path(path).name.endswith(".propose"):
+                raise PermissionError("locked")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", locked_unlink):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertIn("로컬 사본을 지우지 못해 남겨 둡니다", self.stdout)
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_crlf_copy_normalized_by_path_attributes_is_removed(self):
+        # The pushed blob is LF-normalized by a *.md attribute; the cleanup must hash the moved-aside
+        # copy under the original path, or the unchanged CRLF copy would stay and block git pull.
+        run_git(self.root, "config", "core.autocrlf", "false")
+        (self.root / ".git" / "info").mkdir(exist_ok=True)
+        (self.root / ".git" / "info" / "attributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+        self.spec_path.write_bytes(SPEC.replace("\n", "\r\n").encode("utf-8"))
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertFalse(self.spec_path.exists())
+        self.assertEqual([], list(self.spec_path.parent.iterdir()))
+        self.assertIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertEqual(SPEC, run_git(self.root, "show", "origin/spec/demo:docs/tasks/demo.md") + "\n")
+
+    def edited_after_push(self, text):
+        real_open_pr = orchestrator.open_pr
+
+        def edit_then_open(*args, **kwargs):
+            self.spec_path.write_text(text, encoding="utf-8")
+            return real_open_pr(*args, **kwargs)
+        return patch.object(orchestrator, "open_pr", side_effect=edit_then_open)
+
+    def test_restore_without_hard_links_copies_back(self):
+        edited = SPEC + "\n추가 메모\n"
+        with self.edited_after_push(edited), \
+                patch.object(orchestrator.os, "link", side_effect=OSError("no hard links")):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(edited, self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+
+    def test_restore_without_hard_links_never_overwrites_concurrent_save(self):
+        edited = SPEC + "\n추가 메모\n"
+        replacement = SPEC + "\n복원 중에 저장한 수정\n"
+
+        def save_then_fail(*args, **kwargs):
+            # An editor saves a new file after the hard link failed, before the fallback restores.
+            self.spec_path.write_text(replacement, encoding="utf-8")
+            raise OSError("no hard links")
+
+        with self.edited_after_push(edited), patch.object(orchestrator.os, "link", side_effect=save_then_fail):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(replacement, self.spec_path.read_text(encoding="utf-8"))
+        leftovers = [p for p in self.spec_path.parent.iterdir() if p.name.endswith(".propose")]
+        self.assertEqual(1, len(leftovers))
+        self.assertEqual(edited, leftovers[0].read_text(encoding="utf-8"))
+        self.assertIn(str(leftovers[0]), self.stdout)
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_failed_restore_never_deletes_editor_replacement(self):
+        # The exclusive copy fails on close after an editor already replaced the destination; the
+        # editor's file must survive and both paths must be reported.
+        edited = SPEC + "\n추가 메모\n"
+        replacement = SPEC + "\n에디터가 바꿔 저장한 수정\n"
+        spec_path = self.spec_path
+        real_open = open
+
+        class ReplacedOnClose:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def write(self, data):
+                return self.handle.write(data)
+
+            def __exit__(self, *exc):
+                self.handle.close()
+                spec_path.write_text(replacement, encoding="utf-8")
+                raise OSError("close failed")
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            return ReplacedOnClose(handle) if mode == "xb" else handle
+
+        with self.edited_after_push(edited), \
+                patch.object(orchestrator.os, "link", side_effect=OSError("no hard links")), \
+                patch.object(orchestrator, "open", failing_open, create=True):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(replacement, self.spec_path.read_text(encoding="utf-8"))
+        leftovers = [p for p in self.spec_path.parent.iterdir() if p.name.endswith(".propose")]
+        self.assertEqual(1, len(leftovers))
+        self.assertEqual(edited, leftovers[0].read_text(encoding="utf-8"))
+        self.assertIn(str(leftovers[0]), self.stdout)
+        self.assertIn(str(self.spec_path), self.stdout)
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_local_copy_stays_when_index_cannot_be_read(self):
+        # A tracked copy must not be deleted just because git ls-files fails on a corrupt index.
+        run_git(self.root, "add", "docs/tasks/demo.md")
+        index = self.root / ".git" / "index"
+        real_open_pr = orchestrator.open_pr
+
+        def corrupt_then_open(*args, **kwargs):
+            index.write_bytes(b"not an index")
+            return real_open_pr(*args, **kwargs)
+
+        with patch.object(orchestrator, "open_pr", side_effect=corrupt_then_open):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
     def test_already_approved_spec_is_rejected(self):
         self.merge_spec()
@@ -469,6 +739,28 @@ class RunTests(GitFlowTestCase):
             agent.assert_not_called()
         self.assertIn("명세 PR(spec/demo)이 아직 머지되지 않았습니다.", self.stderr)
         self.assertFalse(self.worktree.exists())
+
+    def test_implement_prompt_lists_allowed_command_prefixes(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.cli("run", "demo", "claude"), self.stderr)
+        prompt = next(prompt for _, phase, prompt in self.calls if phase == "implement")
+        for prefix in orchestrator.IMPLEMENT_COMMAND_PREFIXES + POWERSHELL_ONLY:
+            self.assertIn(f"`{prefix}`", prompt)
+        self.assertIn("single command", prompt)
+        for example in ("python -m unittest discover -s tests", "backend/gradlew.bat -p backend test"):
+            self.assertIn(example, prompt)
+        self.assertIn("If you could not run the tests", prompt)
+
+    def test_codex_implement_prompt_has_no_claude_command_guide(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        prompt = next(prompt for agent, phase, prompt in self.calls
+                      if agent == "codex" and phase == "implement")
+        self.assertNotIn(orchestrator.IMPLEMENT_COMMAND_GUIDE, prompt)
+        self.assertNotIn("single command", prompt)
+        self.assertIn("Task specification\n", prompt)
 
     def test_wait_times_out_with_3(self):
         with patch.object(orchestrator, "WAIT_INTERVAL", 0.05):

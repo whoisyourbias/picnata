@@ -275,8 +275,13 @@ python -m harness.orchestrator status add-tests
 채팅에서 직접 요청해도 AGENTS.md의 같은 규칙에 따라 에이전트가 명세를 먼저 쓴다.
 
 - `propose`는 main 체크아웃의 명세(커밋 안 된 파일 가능)를 읽는다. "열린 질문" 절이 정확히 `없음`이 아니면 거부한다.
-  main 체크아웃의 브랜치·인덱스·작업 트리는 바꾸지 않는다. 머지 전에 명세를 고쳤다면 다시 `propose`하면 `spec/<작업 ID>`가 갱신된다.
-  `gh`가 없거나 인증되지 않았으면 push까지 하고 수동 PR URL을 안내한다.
+  main 체크아웃의 브랜치·인덱스는 바꾸지 않는다. push와 PR 생성이 성공하고 main 체크아웃의 명세가 git에서 추적되지 않는 파일이며
+  내용이 push한 것과 같으면, 머지 뒤 `git pull`을 막지 않도록 그 로컬 사본을 지운다. 추적 중이거나 내용이 다르거나 push·PR 생성이 실패하면 남긴다. 비교 전에 파일을 같은 폴더의 임시 이름으로 옮겨 확인한 바이트만 지우므로, 그 사이 편집기가 원래 경로에 새로 저장한 파일은 지우지 않는다.
+  `git ls-files`가 실패하는 등 추적 여부를 git으로 확인하지 못해도 남긴다.
+  파일이 잠겨 지우지 못하면(Windows) 남겨 두었다고 출력하고, 이미 성공한 `propose`는 실패로 바꾸지 않는다.
+  머지 전에 명세를 고치려면 `git show origin/spec/<작업 ID>:docs/tasks/<작업 ID>.md > docs/tasks/<작업 ID>.md`로 되살려 고친 뒤 다시 `propose`하면 `spec/<작업 ID>`가 갱신된다.
+  Windows PowerShell 5.1의 `>`는 UTF-16으로 저장하므로, 그 환경에서는 `git restore --source=origin/spec/<작업 ID> --worktree -- docs/tasks/<작업 ID>.md`로 되살린다(인덱스는 바꾸지 않는다).
+  `gh`가 없거나 인증되지 않았으면 push까지 하고 수동 PR URL을 안내한다(로컬 사본은 남는다).
 - `run`은 `origin/main`에 명세가 있어야 시작한다. 없으면 종료 코드 3이며, `--wait SECONDS`를 주면 30초마다 확인하며 머지를 기다린다.
   명세 내용과 "검증 명령" 절의 명령(첫 코드 블록, 없으면 절 본문 첫 줄)은 `origin/main` 기준이다.
   `harness/<작업 ID>` 브랜치와 `.harness/worktrees/<작업 ID>` worktree를 `origin/main`에서 만들고, 이미 있으면 이어서 진행한다.
@@ -285,6 +290,18 @@ python -m harness.orchestrator status add-tests
 - 모든 하네스 커밋의 작성자는 `harness <harness@example.invalid>`이다. implement는 에이전트의 최종 응답, review는 리뷰어 출력,
   verify는 검증 명령 출력의 마지막 100줄을 본문(최대 8000자)에 남긴다. 에이전트 원본 로그는 `.harness/logs/<작업 ID>/`(로컬)에만 있다.
   Claude 구현자는 `python -m unittest`와 Gradle(`gradle`, `gradlew`, `backend/gradlew` 및 `.bat` 형태) 명령만 실행할 수 있다(review·spec은 읽기 전용).
+  허용 규칙은 하나의 명령 접두어 목록(`IMPLEMENT_COMMAND_PREFIXES`)에서 Bash와 PowerShell 도구 양쪽으로 만들고, PowerShell에는
+  `.\gradlew.bat`, `.\backend\gradlew.bat`, `backend\gradlew.bat`를 더 허용한다. Claude implement 프롬프트는 이 접두어로 시작하는 단일 명령을
+  worktree 루트에서 실행하라고 안내한다. `cd`, `&&`, `;`, `|`, 리디렉션, 임시 스크립트는 승인이 필요해 거부되며,
+  테스트를 못 돌렸으면 최종 응답에 그 사실과 이유를 쓰게 한다.
+  프롬프트는 이 명령을 Bash 도구로 먼저 실행하고, 한 도구가 거부하면 다른 도구로 같은 명령을 다시 시도하라고 안내한다.
+  확인 결과(Windows 11, Windows PowerShell 5.1, `harness-windows-tools` implement round 3): 하네스가 띄운 세션에서
+  `.claude/settings*.json`에 허용 규칙이 없는데도 Bash의 `python -m unittest discover -s tests`(81개 통과)와 `backend/gradlew.bat --version`은
+  승인 없이 실행됐다. 따라서 `--allowedTools`는 세션에 전달된다. 같은 세션의 PowerShell 도구는 `python -m unittest discover -s tests`,
+  `backend/gradlew.bat --version`, `.\backend\gradlew.bat --version`을 모두 "contains multiple operations"로 거부했다.
+  단일 명령도 거부되므로 규칙이 적용되기 전에 Claude Code의 PowerShell 명령 분석 단계에서 막히는 것으로 보이며, 하네스 쪽 규칙으로는 풀 수 없다.
+  PowerShell 규칙은 이 분석이 고쳐지면 바로 쓰이도록 남겨 두고, 지금은 Bash 도구가 실제 실행 경로다.
+  이 안내는 Claude의 도구 권한에 관한 것이므로 Codex 구현자 프롬프트에는 넣지 않는다.
   Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
   검증 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
 - review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 지적을 두 심각도로 나눈다.
@@ -325,7 +342,7 @@ AGENTS.md의 규칙은 권고가 아니라 다음 장치로 강제한다.
 | 장치 | 위치 | 막는 것 |
 | --- | --- | --- |
 | 편집 가드 훅 | `.claude/settings.json` → main 체크아웃의 `harness/guard.py` (`git rev-parse --git-common-dir`의 부모에서 찾으며, worktree의 사본은 쓰지 않고 못 찾으면 거부) | Claude의 main 체크아웃 편집(`docs/tasks/*.md` 제외), `.harness/` 편집, 잠금 파일이 implement를 가리키지 않는 worktree 편집 |
-| Bash 가드 | 같은 훅 | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
+| Bash·PowerShell 가드 | 같은 훅 (`Bash`와 `PowerShell` 도구 이벤트를 같은 명령 문자열 검사로 처리) | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
 | 읽기 전용 spec | `harness/orchestrator.py` | spec 단계 에이전트의 파일 수정 |
 | 명세 PR 머지 | `propose` → `run` | 사람이 머지하지 않은 명세의 구현(`origin/main`에 명세가 없으면 `run`이 거부) |
 | pre-commit 훅 | `.githooks/pre-commit` | `main`/`master` 직접 커밋(충돌 해결 머지 커밋은 허용) |
@@ -341,7 +358,7 @@ GitHub 저장소 설정에서 main 브랜치 보호 규칙을 켜고 `harness-ga
 
 하네스 자체를 유지보수할 때는 에이전트를 띄우는 셸에서 `HARNESS_GUARD=off`를 설정한다(PowerShell: `$env:HARNESS_GUARD='off'`). PR에는 `harness-maintenance` 라벨을 붙인다. 라벨 부여는 사람만 한다. 에이전트가 라벨을 붙이는 명령은 Bash 가드가 거부하지만 문자열 검사라 완전하지 않으므로, 사람이 PR에서 라벨을 확인하는 것이 최종 방어선이다. 라벨 권한 제한은 GitHub 저장소 설정에서 사람이 한다.
 
-한계: Bash 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
+한계: Bash·PowerShell 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
 커밋 트레일러는 서명되지 않아 쓰기 권한이 있으면 위조할 수 있다. 최종 방어선은 사람의 PR 검토와 머지, pre-commit 훅, CI 게이트이다.
 
 **Level 3. Multi-Agent Orchestration**

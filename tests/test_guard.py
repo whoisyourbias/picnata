@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,6 +115,21 @@ class GuardTests(unittest.TestCase):
         self.assertIn("머지", message)
         self.assertEqual(0, self.run_hook({"tool_name": "Bash", "tool_input": {"command": "ls"}})[0])
 
+    def test_powershell_gets_the_same_command_checks(self):
+        # Implement grants approval-free PowerShell rules, so the guard must see those commands too.
+        for command in ("backend/gradlew.bat -p backend test --project-cache-dir .harness/locks",
+                        "python -m unittest discover -s .harness\\locks",
+                        "gh pr merge 3", "gh pr review 4 --approve"):
+            for tool in ("Bash", "PowerShell"):
+                with self.subTest(tool=tool, command=command):
+                    code, message = self.run_hook({"tool_name": tool, "tool_input": {"command": command}})
+                    self.assertEqual(2, code)
+                    self.assertIn("하네스 가드", message)
+        for tool in ("Bash", "PowerShell"):
+            with self.subTest(tool=tool):
+                event = {"tool_name": tool, "tool_input": {"command": "python -m unittest discover -s tests"}}
+                self.assertEqual(0, self.run_hook(event)[0])
+
     def test_label_bypass_is_denied(self):
         for command in ("gh pr edit 3 --add-label harness-maintenance",
                         "gh label create harness-maintenance",
@@ -122,6 +138,15 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(guard.decide_bash(command, {}))
         self.assertIsNone(guard.decide_bash("gh pr view 3", {}))
+
+
+class HookMatcherTests(unittest.TestCase):
+    def test_hook_matcher_covers_both_shell_tools(self):
+        # Implement allows PowerShell commands, so the configured hook must run the guard for them too.
+        settings = json.loads((Path(guard.__file__).parents[1] / ".claude" / "settings.json").read_text("utf-8"))
+        matcher = settings["hooks"]["PreToolUse"][0]["matcher"]
+        for tool in ("Bash", "PowerShell", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+            self.assertTrue(re.fullmatch(matcher, tool), tool)
 
 
 @unittest.skipUnless(shutil.which("sh"), "sh가 필요합니다")

@@ -185,11 +185,30 @@ def run_logged(command, cwd, log, timeout, prompt=None, env=None, stdout_path=No
 
 
 READ_ONLY_PHASES = {"review", "spec"}
-CLAUDE_IMPLEMENT_ALLOWED_TOOLS = [
-    "Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)",
-    "Bash(gradle:*)", "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
-    "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)", "Bash(./backend/gradlew:*)",
+# Test and build command prefixes the implementer may run without approval. Bash and PowerShell rules
+# are both generated from these lists so the two tools never drift apart.
+IMPLEMENT_COMMAND_PREFIXES = [
+    "python -m unittest", "python3 -m unittest",
+    "gradle", "./gradlew", "gradlew", "gradlew.bat",
+    "backend/gradlew", "backend/gradlew.bat", "./backend/gradlew",
 ]
+POWERSHELL_ONLY_PREFIXES = [r".\gradlew.bat", r".\backend\gradlew.bat", r"backend\gradlew.bat"]
+CLAUDE_IMPLEMENT_ALLOWED_TOOLS = (
+    [f"Bash({prefix}:*)" for prefix in IMPLEMENT_COMMAND_PREFIXES]
+    + [f"PowerShell({prefix}:*)" for prefix in IMPLEMENT_COMMAND_PREFIXES + POWERSHELL_ONLY_PREFIXES]
+)
+IMPLEMENT_COMMAND_GUIDE = (
+    "Run tests and builds from the worktree root as a single command that starts with one of these "
+    "allowed prefixes: "
+    + ", ".join(f"`{prefix}`" for prefix in IMPLEMENT_COMMAND_PREFIXES + POWERSHELL_ONLY_PREFIXES)
+    + ". Anything else needs approval and is refused: do not use `cd`, `&&`, `;`, `|`, redirection, "
+    "or run temporary scripts. Examples: `python -m unittest discover -s tests`, "
+    "`python -m unittest tests.test_gate`, `backend/gradlew.bat -p backend test`. "
+    "Prefer the Bash tool for these commands: on Windows PowerShell 5.1 the PowerShell tool has refused "
+    "even single allowed commands as \"multiple operations\". If one tool refuses, retry the same command "
+    "with the other tool. "
+    "If you could not run the tests, say so and why in your final response."
+)
 
 
 def run_agent(agent, phase, prompt, cwd, log, timeout):
@@ -663,8 +682,105 @@ def propose(args, cwd):
     print(f"{args.id}: pushed {branch} ({commit[:12]})")
     goals = spec_sections(spec, "목표", "가정")
     open_pr(main_root, branch, f"spec: {title}", goals + "\n")
+    if remove_pushed_copy(main_root, task_path, blob):
+        print(f"로컬 사본을 지웠습니다. 수정하려면: git show origin/{branch}:{task_path} > {task_path}")
+        print(f"Windows PowerShell에서는 인코딩이 바뀌지 않게: "
+              f"git restore --source=origin/{branch} --worktree -- {task_path}")
     print("명세 PR을 머지하면 승인입니다. 머지한 뒤 run을 실행하세요.")
     return 0
+
+
+def remove_pushed_copy(main_root, task_path, blob):
+    """Delete the untracked specification left in the main checkout once it matches the pushed blob,
+    so a later git pull of the merged specification is not blocked by it."""
+    target = main_root / task_path
+    if not target.is_file() or not is_untracked(main_root, task_path):
+        return False
+    # Move the copy aside before hashing it, so the bytes that are verified are exactly the bytes
+    # that get deleted. Anything an editor saves at the original path meanwhile is left untouched.
+    candidate = target.with_name(f".{target.name}.{uuid4().hex}.propose")
+    try:
+        target.rename(candidate)
+    except OSError as exc:
+        # The proposal already succeeded; a file locked against moving or deletion (common on
+        # Windows) only means the local copy stays, so report it instead of failing propose.
+        print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
+        return False
+    # The path may have been staged between the first check and the rename. Once the copy is moved
+    # aside, staging can no longer pick up these bytes, so this second check is final.
+    if not is_untracked(main_root, task_path):
+        restore_candidate(candidate, target)
+        return False
+    try:
+        # Hash under the original path so the same attributes (eol, filters) apply as for the push.
+        matches = git(main_root, "hash-object", f"--path={task_path}", "--", str(candidate)) == blob
+    except (ValueError, OSError, subprocess.SubprocessError):
+        matches = False
+    if matches:
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
+        else:
+            if not target.exists():
+                return True
+            # The old copy is gone, but a newer file was saved at the path; keep it and do not
+            # suggest a recovery command that would overwrite it.
+            print(f"push한 로컬 사본은 지웠고, 그 뒤 새로 저장된 {target}는 남겨 둡니다.")
+            return False
+    restore_candidate(candidate, target)
+    return False
+
+
+def is_untracked(main_root, task_path):
+    """True only when Git positively reports the path as absent from the index; an index it cannot
+    read (or any other git failure) counts as tracked, so the file is left alone."""
+    try:
+        return not git(main_root, "ls-files", "--", task_path).strip()
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def restore_candidate(candidate, target):
+    """Put a moved-aside copy back at target without overwriting a file saved there in the meantime."""
+    try:
+        os.link(candidate, target)  # fails if target exists, on every platform
+    except FileExistsError:
+        print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
+        return
+    except OSError:
+        # No hard links on this file system. A rename could overwrite a file saved meanwhile, so
+        # copy the bytes into a file created exclusively ("x" fails if target exists) instead.
+        if not copy_exclusive(candidate, target):
+            return
+    try:
+        candidate.unlink()
+    except OSError as exc:
+        print(f"임시 사본 {candidate}를 지우지 못했습니다: {exc}")
+
+
+def copy_exclusive(candidate, target):
+    """Copy candidate to a newly created target; never replaces or deletes an existing target. On any
+    failure the candidate stays at its temporary path and that path is reported."""
+    try:
+        data = candidate.read_bytes()
+        handle = open(target, "xb")
+    except FileExistsError:
+        print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
+        return False
+    except OSError as exc:
+        print(f"로컬 사본을 되돌리지 못해 {candidate}에 남겨 둡니다: {exc}")
+        return False
+    try:
+        with handle:
+            handle.write(data)
+    except OSError as exc:
+        # Exclusive creation proved ownership only when the file was opened; an editor may have
+        # replaced target since. Never delete target here: leave both files and name both paths.
+        print(f"로컬 사본을 되돌리지 못했습니다: {exc}. {target}는 불완전하거나 새로 저장된 파일일 수 "
+              f"있어 그대로 두고, 이전 사본은 {candidate}에 남겨 둡니다.")
+        return False
+    return True
 
 
 # ---- run ---------------------------------------------------------------------------------------
@@ -774,10 +890,13 @@ class Task:
         return log
 
     def implement(self, round_number, last, log):
+        # The command guide describes Claude's tool permissions; Codex runs under its own sandbox.
+        guide = f"{IMPLEMENT_COMMAND_GUIDE}\n\n" if self.agent == "claude" else ""
         prompt = (
             "Implement the task in this worktree. Read the applicable project instructions. "
             "Stay on the assigned branch and keep changes local. The harness commits your changes; "
             "do not run git commit. Report the changes and checks.\n\n"
+            f"{guide}"
             f"Task specification\n{self.spec}"
         )
         if last and last["trailers"].get("Harness-Step") == "review":
