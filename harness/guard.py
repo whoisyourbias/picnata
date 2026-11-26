@@ -1,10 +1,11 @@
 """Claude Code PreToolUse hook: allow file edits only where the harness permits them.
 
 - Main checkout: only task specifications (docs/tasks/*.md).
-- Harness state (.harness/ database and logs): never.
-- Task worktree (.harness/worktrees/<id>): only while that task is running:implement.
+- Harness state (.harness/ locks and logs): never.
+- Task worktree (.harness/worktrees/<id>): only while the lock file .harness/locks/<id>.json
+  names an implement step owned by a live process.
 - Files outside this repository: allowed.
-- Bash: no approving specifications and no touching the harness database.
+- Bash: no merging or approving pull requests and no touching the lock files.
 
 Set HARNESS_GUARD=off in the shell that launches the agent to maintain the harness itself.
 The agent cannot change that variable for the hook process.
@@ -13,15 +14,14 @@ The agent cannot change that variable for the hook process.
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
-from contextlib import closing
 from pathlib import Path, PurePosixPath
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-# The subcommand position: "orchestrator[.py]", optional global options, then "approve".
-APPROVE_COMMAND = re.compile(r"orchestrator(?:\.py)?[\"']?(?:\s+--?[\w-]+(?:[=\s]+[^\s-]\S*)?)*\s+[\"']?approve\b")
+GH_MERGE = re.compile(r"\bgh\b[^|;&\n]*\bpr\s+merge\b")
+GH_APPROVE = re.compile(r"\bgh\b[^|;&\n]*\bpr\s+review\b[^|;&\n]*(?:--approve\b|\s-a\b)")
+LOCKS = re.compile(r"\.harness[/\\]+locks")
 
 
 def git(cwd, *args):
@@ -37,13 +37,37 @@ def existing_dir(path):
     return None
 
 
-def task_phase(state, task_id):
-    database = state / "tasks.sqlite3"
-    if not database.is_file():
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.GetLastError() == 5  # access denied: the process exists
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def running_step(state, task_id):
+    """The step named by a live lock file (.harness/locks/<id>.json), or None."""
+    try:
+        info = json.loads((state / "locks" / f"{task_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    with closing(sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True, timeout=5)) as db:
-        row = db.execute("SELECT phase FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    return row[0] if row else None
+    if not isinstance(info, dict) or not pid_alive(info.get("pid")):
+        return None
+    return info.get("step")
 
 
 def decide(file_path, cwd, env=os.environ):
@@ -71,17 +95,15 @@ def decide(file_path, cwd, env=os.environ):
         if relative.parent == PurePosixPath("docs/tasks") and relative.suffix == ".md":
             return None
         return ("main 체크아웃은 하네스 밖에서 수정할 수 없습니다. 먼저 docs/tasks/<작업 ID>.md 명세를 쓰고 "
-                "사용자 승인 후 `python -m harness.orchestrator run ...`으로 진행하세요.")
+                "`python -m harness.orchestrator propose <작업 ID>`로 명세 PR을 올리세요. 사용자가 머지한 뒤 "
+                "`python -m harness.orchestrator run ...`으로 진행합니다.")
     worktrees = state / "worktrees"
     if toplevel.parent == worktrees:
-        try:
-            phase = task_phase(state, toplevel.name)
-        except sqlite3.Error as exc:
-            return f"작업 상태를 확인할 수 없습니다: {exc}"
-        if phase == "running:implement":
+        step = running_step(state, toplevel.name)
+        if step == "implement":
             return None
         return (f"작업 {toplevel.name}의 worktree는 하네스 implement 단계에서만 수정할 수 있습니다 "
-                f"(현재 단계: {phase or '없음'}).")
+                f"(현재 단계: {step or '없음'}).")
     return None
 
 
