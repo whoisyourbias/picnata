@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR/harness/guard.py\""
+            "command": "common=\"$(git -C \"$CLAUDE_PROJECT_DIR\" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)\" && guard=\"${common%/*}/harness/guard.py\" && [ -n \"$common\" ] && [ -f \"$guard\" ] || { echo '하네스 가드: main 체크아웃의 harness/guard.py를 찾지 못했습니다. 실행을 거부합니다.' >&2; exit 2; }; python \"$guard\" || exit 2"
           }
         ]
       }
