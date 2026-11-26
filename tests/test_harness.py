@@ -1,8 +1,10 @@
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,3 +93,45 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(1, self.cli("review", "demo"))
         with patch.object(orchestrator, "run_agent", side_effect=self.implement):
             self.assertEqual(0, self.cli("implement", "demo"))
+
+    def test_other_tasks_and_duplicate_runs_while_agent_runs(self):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        results = {}
+
+        def busy(agent, phase, prompt, cwd, log, timeout):
+            results["assign"] = self.cli("assign", "other", "task.md", "claude")
+            results["status"] = self.cli("status", "other")
+            results["same"] = self.cli("implement", "demo")
+            self.implement(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=busy):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        self.assertEqual(0, results["assign"])
+        self.assertEqual(0, results["status"])
+        self.assertEqual(1, results["same"])
+
+    def test_other_task_can_implement_while_agent_runs(self):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        self.assertEqual(0, self.cli("assign", "other", "task.md", "codex"))
+        results = {}
+
+        def busy(agent, phase, prompt, cwd, log, timeout):
+            if cwd.name == "demo":
+                results["other"] = self.cli("implement", "other")
+                with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+                    results["phase"] = db.execute("SELECT phase FROM tasks WHERE id='demo'").fetchone()[0]
+
+        with patch.object(orchestrator, "run_agent", side_effect=busy):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        self.assertEqual(0, results["other"])
+        self.assertEqual("running:implement", results["phase"])
+
+    def test_failure_restores_previous_phase(self):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        with patch.object(orchestrator, "run_agent", side_effect=OSError("boom")):
+            self.assertEqual(1, self.cli("review", "demo"))
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            self.assertEqual(("implemented", "boom"), db.execute(
+                "SELECT phase, last_error FROM tasks WHERE id='demo'").fetchone())
