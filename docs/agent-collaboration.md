@@ -269,9 +269,12 @@ python -m harness.orchestrator status add-tests
 - `implement`는 배정된 에이전트를 실행한다. 실행이 끝나면 작업 worktree에 남은 변경을
   하네스가 `harness: implement <task id>` 메시지로 직접 커밋한다. 에이전트가 이미 커밋해 변경이 없으면 커밋하지 않는다.
 - `review`는 상대 에이전트에 명세와 기준 커밋부터 작업 HEAD까지의 diff를 전달한다.
-  `reviewed`는 리뷰 실행이 끝났다는 상태다. 리뷰 의견은 로그에서 확인한다.
-  수정 사항을 커밋한 뒤 `review`를 다시 실행하면 새 커밋을 검증할 수 있다.
-- `verify`는 리뷰한 커밋에서 `--` 뒤에 지정한 명령을 실행한다. 예시 명령은 하네스 자체 테스트이며,
+  리뷰어는 출력 마지막 줄을 `VERDICT: APPROVE` 또는 `VERDICT: REQUEST_CHANGES`로 끝내야 하며,
+  하네스가 로그의 마지막 VERDICT 줄을 파싱해 `review_verdict`와 `review_notes`(최대 8000자)에 저장한다.
+  줄이 없거나 모호하면 `REQUEST_CHANGES`로 취급한다. `status`에서 `review_verdict`를 확인한다.
+  반려되면 `implement`를 다시 실행한다. 이전 리뷰 의견이 프롬프트에 포함된다. 수정 커밋 후 `review`를 다시 실행한다.
+- `verify`는 `review_verdict`가 `APPROVE`일 때만 실행되며, 리뷰한 커밋에서 `--` 뒤에 지정한 명령을 실행한다.
+  예시 명령은 하네스 자체 테스트이며,
   실제 작업에는 해당 작업의 빌드·테스트 명령으로 바꿔 실행한다. 종료 코드 0이면 `verified`로 기록한다.
   최종 병합은 사람이 결정한다.
 - `status`에서 단계, 작업 경로, 마지막 로그와 오류를 확인할 수 있다. 상태 DB는

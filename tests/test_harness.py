@@ -84,12 +84,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("Implement", orchestrator.git(self.worktree, "log", "-1", "--format=%s"))
         self.assertEqual("2", orchestrator.git(self.worktree, "rev-list", "--count", "HEAD"))
 
+    def review(self, verdict_text="VERDICT: APPROVE"):
+        def run(agent, phase, prompt, cwd, log, timeout):
+            log.write_text(f"Findings here.\n{verdict_text}\n", encoding="utf-8")
+        return run
+
+    def prepare_reviewed(self, verdict_text):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.review(verdict_text)):
+            self.assertEqual(0, self.cli("review", "demo"))
+
     def test_cross_review_and_verification(self):
         self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
         with patch.object(orchestrator, "run_agent", side_effect=self.implement):
             self.assertEqual(0, self.cli("implement", "demo"))
         self.assertFalse((self.root / "result.txt").exists())
-        with patch.object(orchestrator, "run_agent") as agent:
+        with patch.object(orchestrator, "run_agent", side_effect=self.review()) as agent:
             self.assertEqual(0, self.cli("review", "demo"))
             self.assertEqual(("claude", "review"), agent.call_args.args[:2])
             self.assertIn("+done", agent.call_args.args[2])
@@ -101,7 +113,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
         with patch.object(orchestrator, "run_agent", side_effect=self.implement):
             self.assertEqual(0, self.cli("implement", "demo"))
-        with patch.object(orchestrator, "run_agent"):
+        with patch.object(orchestrator, "run_agent", side_effect=self.review()):
             self.assertEqual(0, self.cli("review", "demo"))
         (self.worktree / "result.txt").write_text("changed", encoding="utf-8")
         self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "pass"))
@@ -155,3 +167,61 @@ class WorkflowTests(unittest.TestCase):
         with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
             self.assertEqual(("implemented", "boom"), db.execute(
                 "SELECT phase, last_error FROM tasks WHERE id='demo'").fetchone())
+
+    def test_verify_rejected_when_review_requests_changes(self):
+        self.prepare_reviewed("VERDICT: REQUEST_CHANGES")
+        self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "pass"))
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            row = db.execute("SELECT phase, review_verdict FROM tasks").fetchone()
+        self.assertEqual(("reviewed", "REQUEST_CHANGES"), row)
+
+    def test_reimplement_prompt_includes_previous_findings(self):
+        self.prepare_reviewed("VERDICT: REQUEST_CHANGES")
+        prompts = []
+
+        def capture(agent, phase, prompt, cwd, log, timeout):
+            prompts.append(prompt)
+        with patch.object(orchestrator, "run_agent", side_effect=capture):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        self.assertIn("Previous review findings", prompts[0])
+        self.assertIn("Findings here.", prompts[0])
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            row = db.execute("SELECT reviewed_commit, review_verdict FROM tasks").fetchone()
+        self.assertEqual((None, "REQUEST_CHANGES"), row)
+
+    def test_approved_review_is_not_added_to_implement_prompt(self):
+        self.prepare_reviewed("VERDICT: APPROVE")
+        prompts = []
+        with patch.object(orchestrator, "run_agent",
+                          side_effect=lambda *a: prompts.append(a[2])):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        self.assertNotIn("Previous review findings", prompts[0])
+
+    def test_missing_verdict_line_means_request_changes(self):
+        self.prepare_reviewed("No verdict given.")
+        self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "pass"))
+
+    def test_parse_verdict(self):
+        parse = orchestrator.parse_verdict
+        self.assertEqual("APPROVE", parse("ok\nVERDICT: APPROVE\n"))
+        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVE\nVERDICT: REQUEST_CHANGES"))
+        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVE\nVERDICT: MAYBE"))
+        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVE or VERDICT: REQUEST_CHANGES"))
+        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVED"))
+        self.assertEqual("REQUEST_CHANGES", parse(""))
+
+    def test_old_schema_database_is_migrated(self):
+        self.state.mkdir()
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db, db:
+            db.execute("""CREATE TABLE tasks (id TEXT PRIMARY KEY, spec TEXT NOT NULL,
+                implementer TEXT NOT NULL, base TEXT NOT NULL,
+                phase TEXT NOT NULL DEFAULT 'assigned', reviewed_commit TEXT,
+                last_log TEXT, last_error TEXT)""")
+            db.execute("INSERT INTO tasks (id, spec, implementer, base) VALUES ('old', 's', 'codex', 'b')")
+        self.assertEqual(0, self.cli("status", "old"))
+        self.assertEqual(0, self.cli("status", "old"))
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+            row = db.execute("SELECT review_verdict, review_notes FROM tasks").fetchone()
+        self.assertTrue({"review_verdict", "review_notes"} <= columns)
+        self.assertEqual((None, None), row)
