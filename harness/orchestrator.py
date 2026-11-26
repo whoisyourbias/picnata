@@ -109,6 +109,7 @@ IMPLEMENT_COMMAND_GUIDE = (
     + ". Anything else needs approval and is refused: do not use `cd`, `&&`, `;`, `|`, redirection, "
     "or run temporary scripts. Examples: `python -m unittest discover -s tests`, "
     "`python -m unittest tests.test_gate`, `backend/gradlew.bat -p backend test`. "
+    "If the PowerShell tool refuses an allowed command, run the same command with the Bash tool. "
     "If you could not run the tests, say so and why in your final response."
 )
 
@@ -586,6 +587,8 @@ def propose(args, cwd):
     open_pr(main_root, branch, f"spec: {title}", goals + "\n")
     if remove_pushed_copy(main_root, task_path, blob):
         print(f"로컬 사본을 지웠습니다. 수정하려면: git show origin/{branch}:{task_path} > {task_path}")
+        print(f"Windows PowerShell에서는 인코딩이 바뀌지 않게: "
+              f"git restore --source=origin/{branch} --worktree -- {task_path}")
     print("명세 PR을 머지하면 승인입니다. 머지한 뒤 run을 실행하세요.")
     return 0
 
@@ -594,9 +597,16 @@ def remove_pushed_copy(main_root, task_path, blob):
     """Delete the untracked specification left in the main checkout once it matches the pushed blob,
     so a later git pull of the merged specification is not blocked by it."""
     target = main_root / task_path
-    if not target.is_file() or git_ok(main_root, "ls-files", "--error-unmatch", "--", task_path):
+    if not target.is_file():
         return False
-    if git(main_root, "hash-object", "--", str(target)) != blob:
+    try:
+        # Delete only when Git positively reports the path as untracked; an index it cannot read
+        # (or any other git failure) leaves the file alone.
+        if git(main_root, "ls-files", "--", task_path).strip():
+            return False
+        if git(main_root, "hash-object", "--", str(target)) != blob:
+            return False
+    except (ValueError, OSError, subprocess.SubprocessError):
         return False
     target.unlink()
     return True

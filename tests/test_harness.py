@@ -407,6 +407,14 @@ class ProposeTests(GitFlowTestCase):
         self.assertEqual("", run_git(self.root, "status", "--porcelain"))
         self.assertIn("로컬 사본을 지웠습니다. 수정하려면: git show origin/spec/demo:docs/tasks/demo.md "
                       "> docs/tasks/demo.md", self.stdout)
+        restore = "git restore --source=origin/spec/demo --worktree -- docs/tasks/demo.md"
+        self.assertIn(restore, self.stdout)
+        # The Windows-safe recovery command brings back the exact UTF-8 bytes without staging them.
+        run_git(self.root, *restore.split()[1:])
+        self.assertEqual(SPEC.encode("utf-8"), self.spec_path.read_bytes().replace(b"\r\n", b"\n"))
+        self.assertEqual("?? docs/tasks/demo.md",
+                         run_git(self.root, "status", "--porcelain", "--untracked-files=all"))
+        self.spec_path.unlink()
         self.assertEqual(SPEC, run_git(self.root, "show", "origin/spec/demo:docs/tasks/demo.md") + "\n")
         main = run_git(self.origin, "rev-parse", "main")
         self.assertEqual(main, run_git(self.origin, "rev-parse", "spec/demo^"))
@@ -450,6 +458,21 @@ class ProposeTests(GitFlowTestCase):
         # Tracked locally (for example staged) but not on origin/main yet.
         run_git(self.root, "add", "docs/tasks/demo.md")
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_local_copy_stays_when_index_cannot_be_read(self):
+        # A tracked copy must not be deleted just because git ls-files fails on a corrupt index.
+        run_git(self.root, "add", "docs/tasks/demo.md")
+        index = self.root / ".git" / "index"
+        real_open_pr = orchestrator.open_pr
+
+        def corrupt_then_open(*args, **kwargs):
+            index.write_bytes(b"not an index")
+            return real_open_pr(*args, **kwargs)
+
+        with patch.object(orchestrator, "open_pr", side_effect=corrupt_then_open):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
         self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
