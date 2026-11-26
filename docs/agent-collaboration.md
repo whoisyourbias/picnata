@@ -264,8 +264,8 @@ python -m harness.orchestrator status add-tests
 
 - `assign`은 현재 HEAD를 기준으로 `harness/<작업 ID>` 브랜치와 전용 worktree를 만들고
   명세 내용을 SQLite에 저장한다. 마지막 인자에 `claude` 또는 `codex`를 지정한다.
-- `implement`는 배정된 에이전트를 실행한다. 리뷰 전에 작업 worktree의 변경을 커밋해야 한다.
-  CLI의 Git 쓰기 권한이나 로컬 Git 설정 때문에 커밋이 남아 있으면 사용자가 해당 worktree에서 커밋한다.
+- `implement`는 배정된 에이전트를 실행한다. 실행이 끝나면 작업 worktree에 남은 변경을
+  하네스가 `harness: implement <task id>` 메시지로 직접 커밋한다. 에이전트가 이미 커밋해 변경이 없으면 커밋하지 않는다.
 - `review`는 상대 에이전트에 명세와 기준 커밋부터 작업 HEAD까지의 diff를 전달한다.
   `reviewed`는 리뷰 실행이 끝났다는 상태다. 리뷰 의견은 로그에서 확인한다.
   수정 사항을 커밋한 뒤 `review`를 다시 실행하면 새 커밋을 검증할 수 있다.

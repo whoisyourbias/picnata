@@ -62,6 +62,26 @@ class WorkflowTests(unittest.TestCase):
         self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                  "commit", "-m", "Implement", cwd=cwd)
 
+    def implement_uncommitted(self, agent, phase, prompt, cwd, log, timeout):
+        (cwd / "result.txt").write_text("done", encoding="utf-8")
+
+    def test_harness_commits_uncommitted_agent_changes(self):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.implement_uncommitted):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        self.assertEqual("", orchestrator.git(self.worktree, "status", "--porcelain", "--untracked-files=all"))
+        self.assertEqual("harness: implement demo", orchestrator.git(self.worktree, "log", "-1", "--format=%s"))
+        self.assertEqual("harness", orchestrator.git(self.worktree, "log", "-1", "--format=%an"))
+        with patch.object(orchestrator, "run_agent"):
+            self.assertEqual(0, self.cli("review", "demo"))
+
+    def test_no_extra_commit_when_agent_already_committed(self):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        self.assertEqual("Implement", orchestrator.git(self.worktree, "log", "-1", "--format=%s"))
+        self.assertEqual("2", orchestrator.git(self.worktree, "rev-list", "--count", "HEAD"))
+
     def test_cross_review_and_verification(self):
         self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
         with patch.object(orchestrator, "run_agent", side_effect=self.implement):
