@@ -114,6 +114,21 @@ class GuardTests(unittest.TestCase):
         self.assertIn("머지", message)
         self.assertEqual(0, self.run_hook({"tool_name": "Bash", "tool_input": {"command": "ls"}})[0])
 
+    def test_powershell_gets_the_same_command_checks(self):
+        # Implement grants approval-free PowerShell rules, so the guard must see those commands too.
+        for command in ("backend/gradlew.bat -p backend test --project-cache-dir .harness/locks",
+                        "python -m unittest discover -s .harness\\locks",
+                        "gh pr merge 3", "gh pr review 4 --approve"):
+            for tool in ("Bash", "PowerShell"):
+                with self.subTest(tool=tool, command=command):
+                    code, message = self.run_hook({"tool_name": tool, "tool_input": {"command": command}})
+                    self.assertEqual(2, code)
+                    self.assertIn("하네스 가드", message)
+        for tool in ("Bash", "PowerShell"):
+            with self.subTest(tool=tool):
+                event = {"tool_name": tool, "tool_input": {"command": "python -m unittest discover -s tests"}}
+                self.assertEqual(0, self.run_hook(event)[0])
+
     def test_label_bypass_is_denied(self):
         for command in ("gh pr edit 3 --add-label harness-maintenance",
                         "gh label create harness-maintenance",

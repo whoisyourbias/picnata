@@ -329,7 +329,7 @@ AGENTS.md의 규칙은 권고가 아니라 다음 장치로 강제한다.
 | 장치 | 위치 | 막는 것 |
 | --- | --- | --- |
 | 편집 가드 훅 | `.claude/settings.json` → main 체크아웃의 `harness/guard.py` (`git rev-parse --git-common-dir`의 부모에서 찾으며, worktree의 사본은 쓰지 않고 못 찾으면 거부) | Claude의 main 체크아웃 편집(`docs/tasks/*.md` 제외), `.harness/` 편집, 잠금 파일이 implement를 가리키지 않는 worktree 편집 |
-| Bash 가드 | 같은 훅 | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
+| Bash·PowerShell 가드 | 같은 훅 (`Bash`와 `PowerShell` 도구 이벤트를 같은 명령 문자열 검사로 처리) | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
 | 읽기 전용 spec | `harness/orchestrator.py` | spec 단계 에이전트의 파일 수정 |
 | 명세 PR 머지 | `propose` → `run` | 사람이 머지하지 않은 명세의 구현(`origin/main`에 명세가 없으면 `run`이 거부) |
 | pre-commit 훅 | `.githooks/pre-commit` | `main`/`master` 직접 커밋(충돌 해결 머지 커밋은 허용) |
@@ -345,7 +345,7 @@ GitHub 저장소 설정에서 main 브랜치 보호 규칙을 켜고 `harness-ga
 
 하네스 자체를 유지보수할 때는 에이전트를 띄우는 셸에서 `HARNESS_GUARD=off`를 설정한다(PowerShell: `$env:HARNESS_GUARD='off'`). PR에는 `harness-maintenance` 라벨을 붙인다. 라벨 부여는 사람만 한다. 에이전트가 라벨을 붙이는 명령은 Bash 가드가 거부하지만 문자열 검사라 완전하지 않으므로, 사람이 PR에서 라벨을 확인하는 것이 최종 방어선이다. 라벨 권한 제한은 GitHub 저장소 설정에서 사람이 한다.
 
-한계: Bash 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
+한계: Bash·PowerShell 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
 커밋 트레일러는 서명되지 않아 쓰기 권한이 있으면 위조할 수 있다. 최종 방어선은 사람의 PR 검토와 머지, pre-commit 훅, CI 게이트이다.
 
 **Level 3. Multi-Agent Orchestration**
