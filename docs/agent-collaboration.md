@@ -244,6 +244,39 @@ Python + CLI + 작업 상태 관리
 
 작업 분배, 리뷰 요청, 검증 자동화.
 
+### Level 2 실행 방법
+
+저장소 루트에서 Python 3.10 이상과 Git을 사용한다. 에이전트 단계를 실행하려면
+`claude`, `codex` CLI가 PATH에 있어야 하며 각각 인증되어 있어야 한다.
+Windows의 Claude Code 기본 설치 경로(`%USERPROFILE%\.local\bin\claude.exe`)도 자동으로 확인한다.
+Windows Codex Desktop에서 하네스를 실행할 때는 `npm install -g @openai/codex`로
+독립 Codex CLI를 설치한다. 하네스는 PATH 또는 기본 npm 전역 설치 경로에서
+`codex.cmd`를 찾아 실행한다.
+작업 명세 Markdown에는 변경 범위와 완료 조건을 적는다.
+
+```powershell
+python -m harness.orchestrator assign add-tests path/to/task.md codex
+python -m harness.orchestrator implement add-tests
+python -m harness.orchestrator review add-tests
+python -m harness.orchestrator verify add-tests -- python -m unittest discover -s tests
+python -m harness.orchestrator status add-tests
+```
+
+- `assign`은 현재 HEAD를 기준으로 `harness/<작업 ID>` 브랜치와 전용 worktree를 만들고
+  명세 내용을 SQLite에 저장한다. 마지막 인자에 `claude` 또는 `codex`를 지정한다.
+- `implement`는 배정된 에이전트를 실행한다. 리뷰 전에 작업 worktree의 변경을 커밋해야 한다.
+  CLI의 Git 쓰기 권한이나 로컬 Git 설정 때문에 커밋이 남아 있으면 사용자가 해당 worktree에서 커밋한다.
+- `review`는 상대 에이전트에 명세와 기준 커밋부터 작업 HEAD까지의 diff를 전달한다.
+  `reviewed`는 리뷰 실행이 끝났다는 상태다. 리뷰 의견은 로그에서 확인한다.
+  수정 사항을 커밋한 뒤 `review`를 다시 실행하면 새 커밋을 검증할 수 있다.
+- `verify`는 리뷰한 커밋에서 `--` 뒤에 지정한 명령을 실행한다. 예시 명령은 하네스 자체 테스트이며,
+  실제 작업에는 해당 작업의 빌드·테스트 명령으로 바꿔 실행한다. 종료 코드 0이면 `verified`로 기록한다.
+  최종 병합은 사람이 결정한다.
+- `status`에서 단계, 작업 경로, 마지막 로그와 오류를 확인할 수 있다. 상태 DB는
+  `.harness/tasks.sqlite3`, 로그는 `.harness/logs/<작업 ID>/`에 저장된다.
+  실패하면 원인을 해결하고 명령을 다시 실행할 수 있다. 실행 제한은 기본 900초이며
+  명령 앞에 `--timeout 1800`처럼 지정한다.
+
 **Level 3. Multi-Agent Orchestration**
 
 Scheduler + State Machine + CI/CD
