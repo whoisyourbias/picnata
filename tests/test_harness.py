@@ -264,3 +264,32 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.cli("run", "demo", "task.md", "codex")
 
+    def test_spec_runs_agent_with_template_and_request(self):
+        seen = {}
+
+        def agent(name, phase, prompt, cwd, log, timeout):
+            seen.update(name=name, phase=phase, prompt=prompt, cwd=cwd)
+            (cwd / "docs" / "tasks" / "login.md").write_text("# Login\n", encoding="utf-8")
+
+        with patch.object(orchestrator, "run_agent", side_effect=agent):
+            self.assertEqual(0, self.cli("spec", "login", "로그인 기능 {request} 추가", "claude"))
+        self.assertEqual(("claude", "spec", self.root.resolve()), (seen["name"], seen["phase"], seen["cwd"].resolve()))
+        self.assertIn("로그인 기능 {request} 추가", seen["prompt"])
+        self.assertIn("docs/tasks/login.md", seen["prompt"])
+        self.assertNotIn("{task_path}", seen["prompt"])
+        with patch.object(orchestrator, "run_agent") as again:
+            self.assertEqual(1, self.cli("spec", "login", "다시", "claude"))
+        again.assert_not_called()
+
+    def test_spec_rejects_changes_outside_the_specification(self):
+        def agent(name, phase, prompt, cwd, log, timeout):
+            (cwd / "docs" / "tasks" / "login.md").write_text("# Login\n", encoding="utf-8")
+            (cwd / "extra.py").write_text("print()", encoding="utf-8")
+
+        with patch.object(orchestrator, "run_agent", side_effect=agent):
+            self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
+
+    def test_spec_fails_when_agent_writes_nothing(self):
+        with patch.object(orchestrator, "run_agent"):
+            self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
+

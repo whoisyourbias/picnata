@@ -264,6 +264,15 @@ python -m harness.orchestrator verify add-tests -- python -m unittest discover -
 python -m harness.orchestrator status add-tests
 ```
 
+기능 요청은 먼저 `spec`으로 구체화한다. 에이전트가 `harness/prompts/spec.md` 프롬프트에 따라 저장소를 읽고
+`docs/tasks/<작업 ID>.md`에 목표·범위·동작 명세·완료 조건·검증 명령·가정·열린 질문을 작성한다.
+명세 파일 외의 변경이 있으면 실패한다. 사람은 가정과 열린 질문을 확인·수정한 뒤 `run`으로 넘긴다.
+채팅에서 직접 요청해도 AGENTS.md의 같은 규칙에 따라 에이전트가 명세를 먼저 제시한다.
+
+```powershell
+python -m harness.orchestrator spec add-tests "업로드 이미지 크기를 10MB로 제한하고 싶다" claude
+```
+
 단계를 한 번에 돌리려면 `run`을 쓴다. 작업이 없으면 `assign`부터 시작하고, 리뷰가 `REQUEST_CHANGES`면
 리뷰 의견을 넣어 다시 구현·리뷰하며, `APPROVE`가 되면 `verify`까지 실행한다.
 `--`로 검증 명령을 구분하며, 중간에 멈췄거나 실패했다면 같은 명령을 다시 실행해 이어서 진행한다.

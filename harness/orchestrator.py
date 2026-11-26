@@ -81,7 +81,7 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
         native_claude = Path.home() / ".local" / "bin" / "claude.exe"
         executable = shutil.which("claude") or (str(native_claude) if native_claude.is_file() else "claude")
         command = [executable, "-p", "--permission-mode", mode]
-        if not review:
+        if phase == "implement":
             command += ["--allowedTools", "Bash(python -m unittest:*),Bash(python3 -m unittest:*)"]
     else:
         mode = "read-only" if review else "workspace-write"
@@ -243,10 +243,12 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=900, help="Step timeout in seconds.")
     subparsers = parser.add_subparsers(dest="action", required=True)
-    for action in ("assign", "status", "implement", "review", "verify", "run"):
+    for action in ("assign", "status", "implement", "review", "verify", "run", "spec"):
         subparsers.add_parser(action).add_argument("id")
     for name in ("assign", "run"):
         subparsers.choices[name].add_argument("spec", type=Path)
+    subparsers.choices["spec"].add_argument("request", help="Feature request to turn into a task specification.")
+    for name in ("assign", "run", "spec"):
         subparsers.choices[name].add_argument("agent", choices=OTHER_AGENT)
     subparsers.choices["run"].add_argument("--max-rounds", type=int, default=3,
                                            help="Maximum implement runs before asking a human.")
@@ -261,6 +263,8 @@ def parse_args(argv):
         parser.error("Use a task ID of 1–64 lowercase letters, digits and hyphens, starting with a letter.")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be a positive number of seconds.")
+    if args.action == "spec" and not args.request.strip():
+        parser.error("spec requires a non-empty feature request.")
     if args.action == "run" and args.max_rounds < 1:
         parser.error("--max-rounds must be at least 1.")
     if args.action in ("verify", "run") and not args.command:
@@ -320,11 +324,49 @@ def run_task(args, cwd):
             return step("verify", args.id, "--", *args.command)
 
 
+def write_spec(args, cwd):
+    """Have an agent turn a feature request into docs/tasks/<id>.md using harness/prompts/spec.md."""
+    root, state = locate(cwd)
+    task_path = f"docs/tasks/{args.id}.md"
+    target = root / task_path
+    if target.exists():
+        raise ValueError(f"Task specification already exists: {task_path}")
+    template = (Path(__file__).parent / "prompts" / "spec.md").read_text(encoding="utf-8")
+    prompt = template.replace("{task_path}", task_path).replace("{request}", args.request.strip())
+
+    def snapshot():
+        return (git(root, "status", "--porcelain", "--untracked-files=all"),
+                git(root, "diff", "--no-ext-diff", "--no-textconv"))
+
+    before = snapshot()
+    log = state / "logs" / args.id / f"spec-{uuid4().hex}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.touch()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        run_agent(args.agent, "spec", prompt, root, log, args.timeout)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"{exc} (log: {log})") from exc
+    status_before = set(before[0].splitlines())
+    stray = [line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
+             if line not in status_before and not line.endswith(task_path)
+             and not line[3:].startswith(".harness/")]
+    if stray or snapshot()[1] != before[1]:
+        raise ValueError("The agent changed files other than the specification; review with git status "
+                         f"and git diff before continuing. Unexpected: {stray or 'tracked file edits'}")
+    if not target.is_file() or not target.read_text(encoding="utf-8", errors="replace").strip():
+        raise ValueError(f"The agent did not write {task_path}. Log: {log}")
+    print(f"{args.id}: specification written to {task_path}; log: {log}")
+    print("Review and edit it, then run:\n"
+          f"  python -m harness.orchestrator run {args.id} {task_path} <claude|codex> -- <verification command>")
+    return 0
+
+
 def main(argv=None, cwd=None):
     args = parse_args(argv)
-    if args.action == "run":
+    if args.action in ("run", "spec"):
         try:
-            return run_task(args, cwd)
+            return run_task(args, cwd) if args.action == "run" else write_spec(args, cwd)
         except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
             print(exc, file=sys.stderr)
             return 1
