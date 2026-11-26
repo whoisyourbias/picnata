@@ -109,7 +109,9 @@ IMPLEMENT_COMMAND_GUIDE = (
     + ". Anything else needs approval and is refused: do not use `cd`, `&&`, `;`, `|`, redirection, "
     "or run temporary scripts. Examples: `python -m unittest discover -s tests`, "
     "`python -m unittest tests.test_gate`, `backend/gradlew.bat -p backend test`. "
-    "If the PowerShell tool refuses an allowed command, run the same command with the Bash tool. "
+    "Prefer the Bash tool for these commands: on Windows PowerShell 5.1 the PowerShell tool has refused "
+    "even single allowed commands as \"multiple operations\". If one tool refuses, retry the same command "
+    "with the other tool. "
     "If you could not run the tests, say so and why in your final response."
 )
 

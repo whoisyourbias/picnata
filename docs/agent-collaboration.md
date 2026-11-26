@@ -293,7 +293,13 @@ python -m harness.orchestrator status add-tests
   `.\gradlew.bat`, `.\backend\gradlew.bat`, `backend\gradlew.bat`를 더 허용한다. implement 프롬프트는 이 접두어로 시작하는 단일 명령을
   worktree 루트에서 실행하라고 안내한다. `cd`, `&&`, `;`, `|`, 리디렉션, 임시 스크립트는 승인이 필요해 거부되며,
   테스트를 못 돌렸으면 최종 응답에 그 사실과 이유를 쓰게 한다.
-  PowerShell 도구가 허용 명령을 거부하면(round 2에서 단일 `python -m unittest`도 "multiple operations"로 거부됨) 같은 명령을 Bash 도구로 실행하라고 안내한다.
+  프롬프트는 이 명령을 Bash 도구로 먼저 실행하고, 한 도구가 거부하면 다른 도구로 같은 명령을 다시 시도하라고 안내한다.
+  확인 결과(Windows 11, Windows PowerShell 5.1, `harness-windows-tools` implement round 3): 하네스가 띄운 세션에서
+  `.claude/settings*.json`에 허용 규칙이 없는데도 Bash의 `python -m unittest discover -s tests`(81개 통과)와 `backend/gradlew.bat --version`은
+  승인 없이 실행됐다. 따라서 `--allowedTools`는 세션에 전달된다. 같은 세션의 PowerShell 도구는 `python -m unittest discover -s tests`,
+  `backend/gradlew.bat --version`, `.\backend\gradlew.bat --version`을 모두 "contains multiple operations"로 거부했다.
+  단일 명령도 거부되므로 규칙이 적용되기 전에 Claude Code의 PowerShell 명령 분석 단계에서 막히는 것으로 보이며, 하네스 쪽 규칙으로는 풀 수 없다.
+  PowerShell 규칙은 이 분석이 고쳐지면 바로 쓰이도록 남겨 두고, 지금은 Bash 도구가 실제 실행 경로다.
   Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
   검증 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
 - review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 출력 마지막 줄을
