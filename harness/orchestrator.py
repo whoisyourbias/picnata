@@ -1139,7 +1139,15 @@ def status(args, cwd):
     print(f"task: {args.id}\nspec approved (origin/main): {'yes' if approved else 'no'}")
     if local or remote:
         commits = read_commits(main_root, branch if local else f"origin/{branch}", merged_task=args.id)
-        step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
+        try:
+            step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
+        except ValueError as error:
+            # Unadopted human commits: still show where the branch stands and keep the adoption history.
+            harness = [c for c in commits if "Harness-Step" in c["trailers"]]
+            rounds = [int(c["trailers"].get("Harness-Round", 0) or 0) for c in harness
+                      if c["trailers"]["Harness-Step"] == "implement"]
+            step, round_number = "adopt (--adopt 필요: 트레일러 없는 커밋 있음)", max(rounds, default=1)
+            print(f"warning: {str(error).splitlines()[0]}", file=sys.stderr)
         verdict = next((c["trailers"].get("Harness-Verdict") for c in commits
                         if c["trailers"].get("Harness-Step") == "review"), None)
         pushed = remote and (not local or git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}"))

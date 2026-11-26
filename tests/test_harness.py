@@ -1249,6 +1249,16 @@ class AdoptTests(GitFlowTestCase):
         self.assertEqual([], gate.check(self.worktree, base, "HEAD", "harness/demo"))
         self.assertIn(f"adopted: {human}..{human} (round 2)", self.status_text())
 
+    def test_status_keeps_adoption_history_while_another_human_commit_is_pending(self):
+        self.after_request_changes()
+        self.human_commit()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("APPROVE",))):
+            self.run_cli("codex", "--adopt", "--max-rounds", "1")
+        self.human_commit("two.txt", "2")
+        text = self.status_text()
+        self.assertIn("adopted: ", text)
+        self.assertIn("(round 2)", text)
+
     def test_adopt_on_a_branch_without_harness_commits_is_round_1(self):
         self.merge_spec()
         orchestrator.ensure_worktree(self.root, self.state, "demo")
