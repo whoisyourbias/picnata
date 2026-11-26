@@ -86,6 +86,27 @@ class AgentLaunchTests(unittest.TestCase):
                 self.assertEqual("1", os.environ["CODEX_WINDOWS_REGISTERED_CORE"])
 
 
+class ClaudeFinalResponseTests(unittest.TestCase):
+    def test_claude_stdout_is_captured_apart_from_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log, final = root / "implement.log", root / "implement-final.md"
+            with patch.object(orchestrator, "run_logged") as run:
+                result = orchestrator.run_agent("claude", "implement", "Go", root, log, 60)
+            self.assertEqual(final, result)
+            self.assertEqual(final, run.call_args.kwargs["stdout_path"])
+
+    def test_run_logged_keeps_stderr_out_of_the_final_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = "import sys; print('FINAL'); print('DIAGNOSTIC', file=sys.stderr)"
+            orchestrator.run_logged([sys.executable, "-c", script], root, root / "a.log", 60,
+                                    stdout_path=root / "a-final.md")
+            self.assertEqual("FINAL", (root / "a-final.md").read_text(encoding="utf-8").strip())
+            self.assertNotIn("DIAGNOSTIC", (root / "a-final.md").read_text(encoding="utf-8"))
+            self.assertIn("DIAGNOSTIC", (root / "a.log").read_text(encoding="utf-8"))
+
+
 class SpecParsingTests(unittest.TestCase):
     def command(self, section):
         return orchestrator.verify_command(f"# T\n\n## 검증 명령\n{section}\n\n## 가정\n- x\n")[1]
@@ -497,6 +518,26 @@ class RunTests(GitFlowTestCase):
                 patch.object(orchestrator, "push_branch", real_push):
             self.assertEqual(0, self.run_cli(), self.stderr)
         self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+
+    def test_tree_changed_during_verify_is_not_recorded_as_pass(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("REQUEST_CHANGES", "APPROVE"))):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+
+        def tamper(command, cwd, log, timeout, **kwargs):
+            (self.worktree / "late.txt").write_text("late", encoding="utf-8")
+
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("APPROVE",))), \
+                patch.object(orchestrator, "run_logged", tamper):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+        self.assertNotIn("verify", [step for step, _ in self.steps()])
+
+    def test_rerun_after_completion_needs_no_push(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        with patch.object(orchestrator, "push_branch", side_effect=ValueError("offline")):
+            self.assertEqual(0, self.run_cli(), self.stderr)
 
     def test_status_reads_stage_from_git(self):
         self.merge_spec()

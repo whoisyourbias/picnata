@@ -68,7 +68,8 @@ def git_ok(cwd, *args):
     return True
 
 
-def run_logged(command, cwd, log, timeout, prompt=None, env=None):
+def run_logged(command, cwd, log, timeout, prompt=None, env=None, stdout_path=None):
+    """Run a command with output in log. With stdout_path, stdout goes there and only stderr to log."""
     name = command[0]
     if ("/" in name or "\\" in name) and not Path(name).is_absolute():
         candidate = (Path(cwd) / name).absolute()
@@ -78,12 +79,21 @@ def run_logged(command, cwd, log, timeout, prompt=None, env=None):
     if executable is None:
         raise FileNotFoundError(f"Executable not found: {command[0]}")
     with log.open("wb") as output:
-        result = subprocess.run(
-            [executable, *command[1:]], cwd=cwd, env=env,
-            input=prompt.encode("utf-8") if prompt is not None else None,
-            stdin=subprocess.DEVNULL if prompt is None else None,
-            stdout=output, stderr=subprocess.STDOUT, timeout=timeout,
-        )
+        if stdout_path is None:
+            result = subprocess.run(
+                [executable, *command[1:]], cwd=cwd, env=env,
+                input=prompt.encode("utf-8") if prompt is not None else None,
+                stdin=subprocess.DEVNULL if prompt is None else None,
+                stdout=output, stderr=subprocess.STDOUT, timeout=timeout,
+            )
+        else:
+            with Path(stdout_path).open("wb") as captured:
+                result = subprocess.run(
+                    [executable, *command[1:]], cwd=cwd, env=env,
+                    input=prompt.encode("utf-8") if prompt is not None else None,
+                    stdin=subprocess.DEVNULL if prompt is None else None,
+                    stdout=captured, stderr=output, timeout=timeout,
+                )
     if result.returncode:
         raise ValueError(f"{command[0]} exited with code {result.returncode}")
 
@@ -101,6 +111,7 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
     read_only = phase in READ_ONLY_PHASES
     env = None
     final = log
+    stdout_path = None
     if agent == "claude":
         native_claude = Path.home() / ".local" / "bin" / "claude.exe"
         executable = shutil.which("claude") or (str(native_claude) if native_claude.is_file() else "claude")
@@ -111,6 +122,9 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
             command = [executable, "-p", "--permission-mode", "plan" if read_only else "acceptEdits"]
         if phase == "implement":
             command += ["--allowedTools", ",".join(CLAUDE_IMPLEMENT_ALLOWED_TOOLS)]
+        # stdout is the final response; stderr diagnostics stay in the local log only.
+        final = log.with_name(log.stem + "-final.md")
+        stdout_path = final
     else:
         mode = "read-only" if read_only else "workspace-write"
         executable = shutil.which("codex") or "codex"
@@ -130,7 +144,7 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
         final = log.with_name(log.stem + "-final.md")
         command += ["-o", str(final)]
         command.append("-")
-    run_logged(command, cwd, log, timeout, prompt, env=env)
+    run_logged(command, cwd, log, timeout, prompt, env=env, stdout_path=stdout_path)
     return final
 
 
@@ -456,8 +470,15 @@ def open_pr(cwd, head, title, body):
     if url := find_pr(executable, cwd, head):
         print(f"PR: {url}")
         return url
-    output = run_gh(executable, cwd, "pr", "create", "--base", "main", "--head", head,
-                    "--title", title, "--body-file", "-", input=body)
+    try:
+        output = run_gh(executable, cwd, "pr", "create", "--base", "main", "--head", head,
+                        "--title", title, "--body-file", "-", input=body)
+    except ValueError:
+        # A concurrent run may have created the PR between the lookup and the create.
+        if url := find_pr(executable, cwd, head):
+            print(f"PR: {url}")
+            return url
+        raise
     url = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
     print(f"PR: {url}")
     return url
@@ -665,6 +686,10 @@ class Task:
             shutil.rmtree(scratch, ignore_errors=True)
             git_ok(self.worktree, "worktree", "prune")
         result = "fail" if error else "pass"
+        # The result is recorded on the live worktree: it must still be the tree that was tested.
+        ensure_clean(self.worktree)
+        if git(self.worktree, "rev-parse", "HEAD") != head:
+            raise ValueError("검증하는 동안 작업 커밋이 바뀌었습니다.")
         output = "\n".join(read_text_tail(log).splitlines()[-100:])
         if error and error not in output:
             output += f"\n{error}"
@@ -676,7 +701,8 @@ class Task:
 
     def finish(self, commits):
         """Verification passed: push and open the implementation pull request."""
-        push_branch(self.worktree, self.id)
+        if pending_push(self.worktree, self.id):
+            push_branch(self.worktree, self.id)
         title = spec_title(self.spec, self.id)
         rounds = max((int(c["trailers"].get("Harness-Round", 0) or 0) for c in commits
                       if c["trailers"].get("Harness-Step") == "implement"), default=1)

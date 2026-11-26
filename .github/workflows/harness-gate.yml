@@ -27,19 +27,18 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, '|') }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          labels=()
-          IFS='|' read -r -a labels <<< "$LABELS"
+          # 라벨 이름은 JSON 배열 그대로 다룬다(구분자 문자가 들어간 이름이 다른 라벨로 쪼개지지 않도록).
+          # base 리비전에 harness/gate.py가 아직 없을 수 있으므로(부트스트랩) 라벨은 먼저 확인한다.
+          if [ "$(jq -r 'any(.[]; . == "harness-maintenance")' <<< "$LABELS_JSON")" = "true" ]; then
+            echo "harness-maintenance 라벨: 게이트 통과"
+            exit 0
+          fi
           args=()
-          for label in "${labels[@]}"; do
+          while IFS= read -r -d '' label; do
             args+=(--label "$label")
-            # base 리비전에 harness/gate.py가 아직 없을 수 있으므로(부트스트랩) 라벨은 먼저 확인한다.
-            if [ "$label" = "harness-maintenance" ]; then
-              echo "harness-maintenance 라벨: 게이트 통과"
-              exit 0
-            fi
-          done
+          done < <(jq -j '.[] | ., "\u0000"' <<< "$LABELS_JSON")
           cd trusted
           python -m harness.gate --repo ../pr --base "$BASE_SHA" --head "$HEAD_SHA" --branch "$HEAD_REF" "${args[@]}"
       - name: Harness tests
