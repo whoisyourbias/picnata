@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -95,6 +96,10 @@ class SpecParsingTests(unittest.TestCase):
     def test_command_from_first_body_line_without_block(self):
         self.assertEqual(["python", "-c", "pass"], self.command("`python -c pass`\n두 번째 줄"))
 
+    def test_multiline_code_block_is_one_command(self):
+        self.assertEqual(["python", "-m", "unittest", "-v", "x"],
+                         self.command("```\npython -m unittest \\\n  -v\nx\n```"))
+
     def test_empty_command_is_an_error(self):
         with self.assertRaises(ValueError):
             self.command("```\n```")
@@ -129,6 +134,31 @@ class LockTests(unittest.TestCase):
             self.assertEqual((os.getpid(), "verify"), (info["pid"], info["step"]))
             self.assertIn("started", info)
         self.assertFalse(self.lock.exists())
+
+    def test_concurrent_reclaim_admits_only_one(self):
+        import threading
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self.lock.parent.mkdir()
+        self.lock.write_text(json.dumps({"pid": child.pid, "step": "implement"}), encoding="utf-8")
+        inside, refused, barrier = [], [], threading.Barrier(4)
+
+        def worker():
+            barrier.wait()
+            try:
+                with orchestrator.step_lock(self.state, "demo", "implement"):
+                    inside.append(1)
+                    time.sleep(0.3)
+            except ValueError:
+                refused.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(1, len(inside))
+        self.assertEqual(3, len(refused))
 
     def test_lock_is_removed_on_exception(self):
         with self.assertRaises(RuntimeError):

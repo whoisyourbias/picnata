@@ -73,9 +73,12 @@ def main(argv=None, cwd=None):
     parser.add_argument("--head", required=True)
     parser.add_argument("--branch", required=True)
     parser.add_argument("--label", nargs="*", action="extend", default=[])
+    parser.add_argument("--repo", help="검사할 git 저장소 경로 (기본: 현재 디렉터리)")
     args = parser.parse_args(argv)
+    if args.repo:
+        cwd = args.repo
     try:
-        errors = check(cwd, args.base, args.head, args.branch, {label for label in args.label if label})
+        errors = check(cwd,args.base, args.head, args.branch, {label for label in args.label if label})
     except (ValueError, OSError) as exc:
         errors = [f"검사하지 못했습니다: {exc}"]
     for error in errors:

@@ -9,9 +9,16 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
+      # 검사 코드는 보호된 base 리비전에서 실행하고, PR 내용은 git 객체로만 읽는다.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          path: pr
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -26,6 +33,8 @@ jobs:
           IFS='|' read -r -a labels <<< "$LABELS"
           args=()
           for label in "${labels[@]}"; do args+=(--label "$label"); done
-          python -m harness.gate --base "$BASE_SHA" --head "$HEAD_SHA" --branch "$HEAD_REF" "${args[@]}"
+          cd trusted
+          python -m harness.gate --repo ../pr --base "$BASE_SHA" --head "$HEAD_SHA" --branch "$HEAD_REF" "${args[@]}"
       - name: Harness tests
+        working-directory: pr
         run: python -m unittest discover -s tests

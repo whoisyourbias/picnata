@@ -188,7 +188,8 @@ def verify_command(spec):
         raise ValueError("명세에 '검증 명령' 절이 없습니다.")
     lines = body.splitlines()
     candidates = []
-    if any(line.lstrip().startswith("```") for line in lines):
+    inside_block = any(line.lstrip().startswith("```") for line in lines)
+    if inside_block:
         inside = False
         for line in lines:
             if line.lstrip().startswith("```"):
@@ -199,7 +200,17 @@ def verify_command(spec):
                 candidates.append(line)
     else:
         candidates = lines
-    text = next((line.strip() for line in candidates if line.strip()), "")
+    if inside_block:
+        pieces = []
+        for line in candidates:
+            line = line.strip()
+            if line.endswith("\\"):
+                line = line[:-1].rstrip()
+            if line:
+                pieces.append(line)
+        text = " ".join(pieces)
+    else:
+        text = next((line.strip() for line in candidates if line.strip()), "")
     if len(text) > 1 and text.startswith("`") and text.endswith("`"):
         text = text[1:-1].strip()
     command = shlex.split(text) if text else []
@@ -329,29 +340,58 @@ def step_lock(state, task_id, step):
     """Exclusive lock file for the duration of a step; a dead owner's file is reclaimed."""
     path = state / "locks" / f"{task_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    while True:
+    mutex = path.with_suffix(".reclaim")
+
+    def create():
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            info = read_lock(path)
-            if info is None:
-                try:
-                    young = time.time() - path.stat().st_mtime < 5
-                except OSError:
-                    continue
-                if young:
-                    raise ValueError(f"{task_id}: 이미 실행 중입니다.")
-            elif pid_alive(info.get("pid")):
-                raise ValueError(f"{task_id}: 이미 실행 중입니다 ({info.get('step')}, pid {info.get('pid')}).")
+            return False
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "step": step,
+                       "started": datetime.now(timezone.utc).isoformat()}, handle)
+        return True
+
+    def busy_error():
+        info = read_lock(path)
+        if info is None:
+            try:
+                young = time.time() - path.stat().st_mtime < 5
+            except OSError:
+                return None
+            return ValueError(f"{task_id}: 이미 실행 중입니다.") if young else None
+        if pid_alive(info.get("pid")):
+            return ValueError(f"{task_id}: 이미 실행 중입니다 ({info.get('step')}, pid {info.get('pid')}).")
+        return None
+
+    while not create():
+        if (error := busy_error()) is not None:
+            raise error
+        # Stale lock: reclaim under a mutex so two reclaimers cannot delete each other's new lock.
+        try:
+            os.close(os.open(mutex, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            try:
+                if time.time() - mutex.stat().st_mtime > 10:
+                    mutex.unlink()
+            except OSError:
+                pass
+            time.sleep(0.05)
+            continue
+        try:
+            if (error := busy_error()) is not None:
+                raise error
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
-            continue
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "step": step,
-                       "started": datetime.now(timezone.utc).isoformat()}, handle)
-        break
+            if create():
+                break
+        finally:
+            try:
+                mutex.unlink()
+            except FileNotFoundError:
+                pass
     try:
         yield path
     finally:
@@ -596,16 +636,20 @@ class Task:
             raise ValueError("리뷰 승인한 커밋과 현재 내용이 다릅니다. review부터 다시 실행해야 합니다.")
         head = git(self.worktree, "rev-parse", "HEAD")
         error = None
+        # Run in a throwaway detached checkout so the harness branch and its worktree stay untouched.
+        scratch = self.state / "verify" / f"{self.id}-{uuid4().hex}"
+        scratch.parent.mkdir(parents=True, exist_ok=True)
+        git(self.worktree, "worktree", "add", "--detach", "-q", str(scratch), head)
         try:
-            run_logged(self.command, self.worktree, log, self.args.timeout)
+            run_logged(self.command, scratch, log, self.args.timeout)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             error = str(exc) or exc.__class__.__name__
             with log.open("ab") as output:
                 output.write(f"\n{error}\n".encode("utf-8"))
-        if error is None:
-            if git(self.worktree, "rev-parse", "HEAD") != head or git(
-                    self.worktree, "status", "--porcelain", "--untracked-files=all"):
-                error = "검증 중 worktree가 바뀌었습니다."
+        finally:
+            git_ok(self.worktree, "worktree", "remove", "--force", str(scratch))
+            shutil.rmtree(scratch, ignore_errors=True)
+            git_ok(self.worktree, "worktree", "prune")
         result = "fail" if error else "pass"
         output = "\n".join(read_text_tail(log).splitlines()[-100:])
         if error and error not in output:
@@ -614,9 +658,6 @@ class Task:
             f"harness({self.id}): verify {result}", output,
             [("Harness-Task", self.id), ("Harness-Step", "verify"), ("Harness-Verified", reviewed),
              ("Harness-Result", result), ("Harness-Command", self.command_text)])
-        if error:
-            git(self.worktree, "reset", "--hard", "-q", "HEAD")
-            git(self.worktree, "clean", "-fdq")
         return harness_commit(self.worktree, message), result
 
     def finish(self, commits):
