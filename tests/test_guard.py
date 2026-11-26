@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -137,6 +138,15 @@ class GuardTests(unittest.TestCase):
             with self.subTest(command):
                 self.assertIsNotNone(guard.decide_bash(command, {}))
         self.assertIsNone(guard.decide_bash("gh pr view 3", {}))
+
+
+class HookMatcherTests(unittest.TestCase):
+    def test_hook_matcher_covers_both_shell_tools(self):
+        # Implement allows PowerShell commands, so the configured hook must run the guard for them too.
+        settings = json.loads((Path(guard.__file__).parents[1] / ".claude" / "settings.json").read_text("utf-8"))
+        matcher = settings["hooks"]["PreToolUse"][0]["matcher"]
+        for tool in ("Bash", "PowerShell", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+            self.assertTrue(re.fullmatch(matcher, tool), tool)
 
 
 @unittest.skipUnless(shutil.which("sh"), "sh가 필요합니다")
