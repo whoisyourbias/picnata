@@ -130,6 +130,17 @@ class SpecParsingTests(unittest.TestCase):
             orchestrator.verify_command("# T\n\n## 목표\nx\n")
 
 
+class ParseVerdictTests(unittest.TestCase):
+    def test_last_line_decides(self):
+        parse = orchestrator.parse_verdict
+        self.assertEqual("APPROVE", parse("좋습니다.\nVERDICT: APPROVE"))
+        self.assertEqual("APPROVE", parse("좋습니다.\n  VERDICT: APPROVE  \n\n\n"))
+        self.assertEqual("REQUEST_CHANGES", parse("문제\nVERDICT: REQUEST_CHANGES\n"))
+        self.assertEqual("MISSING", parse("VERDICT: APPROVE\n그러나 버그가 있습니다."))
+        self.assertEqual("MISSING", parse("VERDICT: APPROVE please"))
+        self.assertEqual("MISSING", parse(""))
+
+
 class LockTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -516,27 +527,40 @@ class RunTests(GitFlowTestCase):
         self.assertEqual(command, trailers["Harness-Command"])
         self.assertEqual("a b", trailers["Harness-Task"])
 
-    def test_stale_plan_is_not_executed(self):
-        """Another run advanced the branch between planning and taking the lock."""
+    def test_sync_and_planning_happen_under_the_lock(self):
+        """Nothing that can move HEAD runs before the task lock is held."""
         self.merge_spec()
-        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
-            self.assertEqual(1, self.run_cli())
-        real_lock = orchestrator.step_lock
+        lock = self.state / "locks" / "demo.json"
+        seen = []
+        real_sync, real_read = orchestrator.sync_remote, orchestrator.read_commits
 
-        @contextlib.contextmanager
-        def racing_lock(state, task_id, step):
-            with real_lock(state, task_id, step) as path:
-                orchestrator.harness_commit(self.worktree, orchestrator.build_message(
-                    "harness(demo): review APPROVE", "", [("Harness-Task", "demo"), ("Harness-Step", "review"),
-                                                          ("Harness-Reviewed", "0" * 40),
-                                                          ("Harness-Verdict", "APPROVE")]))
-                yield path
+        def sync(worktree, task_id):
+            seen.append(("sync", orchestrator.read_lock(lock)))
+            return real_sync(worktree, task_id)
 
-        with patch.object(orchestrator, "step_lock", racing_lock), \
-                patch.object(orchestrator, "run_agent") as agent:
-            self.assertEqual(1, self.run_cli())
-            agent.assert_not_called()
-        self.assertIn("다른 실행이 단계를 진행했습니다", self.stderr)
+        def read(cwd, ref="HEAD", merged_task=None):
+            if merged_task is not None:
+                seen.append(("plan", orchestrator.read_lock(lock)))
+            return real_read(cwd, ref, merged_task)
+
+        steps_in_lock = []
+
+        def agent(name, phase, prompt, cwd, log, timeout):
+            steps_in_lock.append(orchestrator.read_lock(lock)["step"])
+            return self.agent()(name, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "sync_remote", sync), \
+                patch.object(orchestrator, "read_commits", read), \
+                patch.object(orchestrator, "run_agent", side_effect=agent):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertTrue(seen)
+        for kind, info in seen:
+            with self.subTest(kind):
+                self.assertIsNotNone(info)
+                self.assertEqual(os.getpid(), info["pid"])
+        # The lock names the real step while the agent runs (the guard depends on it).
+        self.assertEqual(["implement", "review"], steps_in_lock)
+        self.assertFalse(lock.exists())
 
     def test_raw_log_is_never_committed_when_final_response_is_missing(self):
         self.merge_spec()
@@ -576,6 +600,90 @@ class RunTests(GitFlowTestCase):
                 patch.object(orchestrator, "push_branch", real_push):
             self.assertEqual(0, self.run_cli(), self.stderr)
         self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+
+    def complete_run_then_rewind_local(self):
+        """Origin ends at review; the local branch is stale at implement (as in a second clone)."""
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        review = run_git(self.worktree, "rev-parse", "HEAD~1")
+        implement = run_git(self.worktree, "rev-parse", "HEAD~2")
+        run_git(self.origin, "update-ref", "refs/heads/harness/demo", review)
+        run_git(self.worktree, "reset", "--hard", implement)
+        run_git(self.root, "update-ref", "-d", "refs/remotes/origin/harness/demo")
+        self.calls.clear()
+        return implement, review
+
+    def test_stale_local_branch_fast_forwards_and_skips_review(self):
+        _, review = self.complete_run_then_rewind_local()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent:
+            self.assertEqual(0, self.run_cli(), self.stderr)
+            agent.assert_not_called()
+        self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "pass")], self.steps())
+        self.assertEqual(review, run_git(self.worktree, "rev-parse", "HEAD~1"))
+
+    def test_two_clones_stale_clone_resumes_at_verify(self):
+        """Clone A publishes review; clone B, still at implement locally, must not review again."""
+        self.merge_spec()
+        # Clone A implements and pushes, then stops.
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        # Clone B is a separate clone whose harness worktree holds only the implement commit.
+        clone_b = self.root.parent / "clone-b"
+        run_git(self.root.parent, "clone", str(self.origin), str(clone_b))
+        worktree_b = orchestrator.ensure_worktree(clone_b, clone_b / ".harness", "demo")
+        implement = run_git(worktree_b, "rev-parse", "HEAD")
+        self.assertEqual([("implement", None)], [(c["trailers"]["Harness-Step"], None)
+                                                 for c in orchestrator.read_commits(worktree_b)])
+        # Clone A reviews and pushes the review, then stops before verify.
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                patch.object(orchestrator.Task, "verify", side_effect=ValueError("stop before verify")):
+            self.assertEqual(1, self.run_cli())
+        review = run_git(self.origin, "rev-parse", "harness/demo")
+        self.assertEqual(implement, run_git(self.origin, "rev-parse", "harness/demo~1"))
+        self.calls.clear()
+        # Clone B runs: it fast-forwards to the published review and goes straight to verify.
+        stderr = io.StringIO()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent, \
+                contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, orchestrator.main(["run", "demo", "codex"], cwd=clone_b), stderr.getvalue())
+            agent.assert_not_called()
+        commits = list(reversed(orchestrator.read_commits(worktree_b)))
+        self.assertEqual(["implement", "review", "verify"], [c["trailers"]["Harness-Step"] for c in commits])
+        self.assertEqual(review, commits[1]["sha"])
+        self.assertEqual("pass", commits[2]["trailers"]["Harness-Result"])
+        self.assertEqual(commits[2]["sha"], run_git(self.origin, "rev-parse", "harness/demo"))
+
+    def test_single_branch_clone_resumes_task_branch_after_main_advanced(self):
+        """A clone tracking only main must start harness/<id> from origin's branch, not origin/main."""
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        implement = run_git(self.origin, "rev-parse", "harness/demo")
+        run_git(self.root, *IDENT, "commit", "--allow-empty", "-m", "main moves on")
+        run_git(self.root, "push", "origin", "main")
+        self.calls.clear()
+        clone_b = self.root.parent / "clone-single"
+        run_git(self.root.parent, "clone", "--single-branch", "--branch", "main", str(self.origin), str(clone_b))
+        self.assertEqual("", run_git(clone_b, "branch", "-r", "--list", "origin/harness/*"))
+        stderr = io.StringIO()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, orchestrator.main(["run", "demo", "codex"], cwd=clone_b), stderr.getvalue())
+        self.assertEqual(["review"], [phase for _, phase, _ in self.calls])
+        commits = list(reversed(orchestrator.read_commits(clone_b / ".harness" / "worktrees" / "demo")))
+        self.assertEqual(["implement", "review", "verify"], [c["trailers"]["Harness-Step"] for c in commits])
+        self.assertEqual(implement, commits[0]["sha"])
+
+    def test_diverged_local_and_remote_exits_1_without_agent(self):
+        self.complete_run_then_rewind_local()
+        (self.worktree / "local.txt").write_text("local", encoding="utf-8")
+        run_git(self.worktree, "add", "local.txt")
+        run_git(self.worktree, *IDENT, "commit", "-m", "local only")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("로컬 harness/demo와 origin/harness/demo가 갈라졌습니다", self.stderr)
 
     def test_tree_changed_during_verify_is_not_recorded_as_pass(self):
         self.merge_spec()

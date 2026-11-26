@@ -288,7 +288,7 @@ python -m harness.orchestrator status add-tests
   Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
   검증 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
 - review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 출력 마지막 줄을
-  `VERDICT: APPROVE` 또는 `VERDICT: REQUEST_CHANGES`로 끝내야 하며, 줄이 없으면 `MISSING`, 모호하면 `REQUEST_CHANGES`로 기록한다.
+  `VERDICT: APPROVE` 또는 `VERDICT: REQUEST_CHANGES`로 끝내야 하며, 응답의 마지막 비어 있지 않은 줄만 읽는다. 그 줄이 정확히 두 판정 중 하나가 아니면(본문 중간 인용 포함) `MISSING`으로 기록한다.
   반려되면 이전 리뷰 커밋의 본문이 다음 implement 프롬프트에 들어간다.
 - verify는 마지막 APPROVE 리뷰가 본 커밋과 HEAD의 트리가 같을 때만 실행한다. 실패해도 `Harness-Result: fail` 커밋을 남기고 종료 코드 1로 멈춘다.
   원인을 해결한 뒤 `run`을 다시 실행하면 verify부터 이어진다.
@@ -301,7 +301,9 @@ python -m harness.orchestrator status add-tests
 
 단계를 실행하는 동안 `.harness/locks/<작업 ID>.json`(`pid`, `step`, `started`)을 배타적으로 만들고 끝나면 지운다.
 파일이 있고 pid가 살아 있으면 `이미 실행 중` 오류(종료 코드 1)이다. pid가 죽었으면 하네스가 파일을 지우고 진행한다.
-`run`은 잠금을 얻은 뒤 단계를 다시 계산하므로, 동시에 실행한 다른 프로세스가 이미 진행한 단계를 중복하지 않는다.
+`run`은 HEAD를 움직일 수 있는 일(원격 동기화, push, 단계 계산)을 하기 전에 잠금을 얻는다. 잠금은 `step: plan`으로 만들고, 단계를 정한 뒤 같은 잠금 파일의 `step`을 그 단계로 원자적으로 바꾼다. 그래서 동시에 실행한 다른 프로세스가 단계 도중의 worktree를 움직이거나 이미 진행한 단계를 중복하지 않는다.
+
+잠금을 얻은 뒤, 단계를 계산하기 전에 `git fetch origin harness/<작업 ID>`로 원격과 맞춘다. 로컬이 원격의 조상이고 worktree가 깨끗하면 원격으로 fast-forward하고(다른 클론이 이미 기록한 단계를 다시 실행하지 않는다), 로컬에만 있는 커밋은 단계 계산(트레일러 검사)을 통과한 뒤 push부터 한다. 둘이 갈라졌으면 `로컬 harness/<작업 ID>와 origin/harness/<작업 ID>가 갈라졌습니다` 오류(종료 코드 1)로 에이전트 실행 없이 멈춘다.
 
 ### 하네스 강제 장치
 
@@ -309,12 +311,12 @@ AGENTS.md의 규칙은 권고가 아니라 다음 장치로 강제한다.
 
 | 장치 | 위치 | 막는 것 |
 | --- | --- | --- |
-| 편집 가드 훅 | `.claude/settings.json` → `harness/guard.py` | Claude의 main 체크아웃 편집(`docs/tasks/*.md` 제외), `.harness/` 편집, 잠금 파일이 implement를 가리키지 않는 worktree 편집 |
-| Bash 가드 | 같은 훅 | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정 |
+| 편집 가드 훅 | `.claude/settings.json` → main 체크아웃의 `harness/guard.py` (`git rev-parse --git-common-dir`의 부모에서 찾으며, worktree의 사본은 쓰지 않고 못 찾으면 거부) | Claude의 main 체크아웃 편집(`docs/tasks/*.md` 제외), `.harness/` 편집, 잠금 파일이 implement를 가리키지 않는 worktree 편집 |
+| Bash 가드 | 같은 훅 | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
 | 읽기 전용 spec | `harness/orchestrator.py` | spec 단계 에이전트의 파일 수정 |
 | 명세 PR 머지 | `propose` → `run` | 사람이 머지하지 않은 명세의 구현(`origin/main`에 명세가 없으면 `run`이 거부) |
 | pre-commit 훅 | `.githooks/pre-commit` | `main`/`master` 직접 커밋(충돌 해결 머지 커밋은 허용) |
-| CI 게이트 | `.github/workflows/harness-gate.yml` → `harness/gate.py` | 커밋 트레일러로 확인: `spec/<작업 ID>` PR은 명세 파일 추가 하나뿐이어야 하고, `harness/<작업 ID>` PR은 승인된 명세를 수정하지 않았으며 HEAD가 통과한 verify 커밋이고 검증한 트리를 APPROVE 리뷰가 승인했어야 한다. 그 밖의 브랜치는 `harness-maintenance` 라벨이 없으면 실패. 하네스 테스트도 실행 |
+| CI 게이트 | `.github/workflows/harness-gate.yml` → `harness/gate.py` | 커밋 트레일러로 확인: `spec/<작업 ID>` PR은 명세 파일 추가 하나뿐이어야 하며 base에 같은 명세가 이미 있으면 실패하고, `harness/<작업 ID>` PR은 승인된 명세를 수정하지 않았으며 HEAD가 통과한 verify 커밋이고 검증한 트리를 APPROVE 리뷰가 승인했어야 한다. 그 밖의 브랜치는 `harness-maintenance` 라벨이 없으면 실패. 하네스 테스트도 실행 |
 
 클론마다 한 번 git 훅을 켠다.
 
@@ -324,7 +326,7 @@ git config core.hooksPath .githooks
 
 GitHub 저장소 설정에서 main 브랜치 보호 규칙을 켜고 `harness-gate`를 필수 상태 검사로 지정해야 CI 게이트가 머지를 실제로 막는다.
 
-하네스 자체를 유지보수할 때는 에이전트를 띄우는 셸에서 `HARNESS_GUARD=off`를 설정한다(PowerShell: `$env:HARNESS_GUARD='off'`). PR에는 `harness-maintenance` 라벨을 붙인다.
+하네스 자체를 유지보수할 때는 에이전트를 띄우는 셸에서 `HARNESS_GUARD=off`를 설정한다(PowerShell: `$env:HARNESS_GUARD='off'`). PR에는 `harness-maintenance` 라벨을 붙인다. 라벨 부여는 사람만 한다. 에이전트가 라벨을 붙이는 명령은 Bash 가드가 거부하지만 문자열 검사라 완전하지 않으므로, 사람이 PR에서 라벨을 확인하는 것이 최종 방어선이다. 라벨 권한 제한은 GitHub 저장소 설정에서 사람이 한다.
 
 한계: Bash 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
 커밋 트레일러는 서명되지 않아 쓰기 권한이 있으면 위조할 수 있다. 최종 방어선은 사람의 PR 검토와 머지, pre-commit 훅, CI 게이트이다.
