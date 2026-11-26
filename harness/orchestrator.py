@@ -890,14 +890,17 @@ def adopt_human_commits(worktree, task_id, commits, spec_path):
     if not pending:
         return None
     ensure_clean(worktree)
-    # Commits an earlier adoption already recorded sit directly below its adopt commit.
+    # Only the exact range an earlier adopt record names counts as adopted.
     covered = set()
-    for index, commit in enumerate(commits):
-        if commit["trailers"].get("Harness-Adopted"):
-            for older in commits[index + 1:]:
-                if "Harness-Step" in older["trailers"]:
-                    break
-                covered.add(older["sha"])
+    for commit in commits:
+        recorded = commit["trailers"].get("Harness-Adopted")
+        if recorded and "Harness-Step" in commit["trailers"]:
+            first, _, last = recorded.partition("..")
+            if first and last:
+                try:
+                    covered.update(git(worktree, "rev-list", f"{first}^..{last}").split())
+                except ValueError:
+                    pass
     pending_shas = {commit["sha"] for commit in pending}
     trailerless = [commit for commit in commits
                    if "Harness-Step" not in commit["trailers"] and commit["sha"] not in covered]
@@ -1149,7 +1152,7 @@ def status(args, cwd):
         pushed = remote and (not local or git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}"))
         print(f"next step: {step}\nround: {round_number}\nlast verdict: {verdict or '-'}")
         for commit in reversed(commits):
-            if adopted := commit["trailers"].get("Harness-Adopted"):
+            if "Harness-Step" in commit["trailers"] and (adopted := commit["trailers"].get("Harness-Adopted")):
                 print(f"adopted: {adopted} (round {commit['trailers'].get('Harness-Round', '?')})")
         print(f"branch: {branch}\npushed: {'yes' if pushed else 'no'}")
     else:
