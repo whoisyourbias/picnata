@@ -49,6 +49,10 @@ class WorkflowTests(unittest.TestCase):
         (self.root / "task.md").write_text("Add a file.", encoding="utf-8")
         self.state = self.root / ".harness"
         self.worktree = self.state / "worktrees" / "demo"
+        # The approval gate has its own tests; workflow tests start from an approved specification.
+        approval = patch.object(orchestrator, "check_approval")
+        approval.start()
+        self.addCleanup(approval.stop)
 
     def git(self, *args, cwd=None):
         subprocess.run(["git", *args], cwd=cwd or self.root, check=True,
@@ -264,32 +268,134 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.cli("run", "demo", "task.md", "codex")
 
+    def spec_agent(self, output, seen=None, side=None):
+        def agent(name, phase, prompt, cwd, log, timeout):
+            if seen is not None:
+                seen.update(name=name, phase=phase, prompt=prompt, cwd=cwd)
+            if side:
+                side(cwd)
+            log.write_text(output, encoding="utf-8")
+            return log
+        return agent
+
     def test_spec_runs_agent_with_template_and_request(self):
         seen = {}
-
-        def agent(name, phase, prompt, cwd, log, timeout):
-            seen.update(name=name, phase=phase, prompt=prompt, cwd=cwd)
-            (cwd / "docs" / "tasks" / "login.md").write_text("# Login\n", encoding="utf-8")
-
-        with patch.object(orchestrator, "run_agent", side_effect=agent):
+        output = "명세입니다.\n# Login\n\n## 가정\n- 이메일 로그인\n\n## 열린 질문\n없음\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent(output, seen)):
             self.assertEqual(0, self.cli("spec", "login", "로그인 기능 {request} 추가", "claude"))
         self.assertEqual(("claude", "spec", self.root.resolve()), (seen["name"], seen["phase"], seen["cwd"].resolve()))
         self.assertIn("로그인 기능 {request} 추가", seen["prompt"])
         self.assertIn("docs/tasks/login.md", seen["prompt"])
         self.assertNotIn("{task_path}", seen["prompt"])
+        written = (self.root / "docs" / "tasks" / "login.md").read_text(encoding="utf-8")
+        self.assertTrue(written.startswith("# Login\n"))
         with patch.object(orchestrator, "run_agent") as again:
             self.assertEqual(1, self.cli("spec", "login", "다시", "claude"))
         again.assert_not_called()
 
     def test_spec_rejects_changes_outside_the_specification(self):
-        def agent(name, phase, prompt, cwd, log, timeout):
-            (cwd / "docs" / "tasks" / "login.md").write_text("# Login\n", encoding="utf-8")
+        def side(cwd):
             (cwd / "extra.py").write_text("print()", encoding="utf-8")
 
-        with patch.object(orchestrator, "run_agent", side_effect=agent):
+        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent("# Login\n", side=side)):
+            self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
+        self.assertFalse((self.root / "docs" / "tasks" / "login.md").exists())
+
+    def test_spec_rejects_agent_writing_the_specification_itself(self):
+        def side(cwd):
+            (cwd / "docs" / "tasks" / "login.md").write_text("# Login\n", encoding="utf-8")
+
+        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent("# Login\n", side=side)):
             self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
 
-    def test_spec_fails_when_agent_writes_nothing(self):
-        with patch.object(orchestrator, "run_agent"):
+    def test_spec_fails_when_agent_outputs_no_specification(self):
+        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent("명세를 못 썼습니다.")):
             self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
+        self.assertFalse((self.root / "docs" / "tasks" / "login.md").exists())
 
+    def test_extract_spec(self):
+        self.assertEqual("# A\nbody\n", orchestrator.extract_spec("```markdown\n# A\nbody\n```"))
+        self.assertEqual("# A\n", orchestrator.extract_spec("요약\n# A"))
+        self.assertIsNone(orchestrator.extract_spec("## only a section"))
+
+
+class SpecLaunchTests(unittest.TestCase):
+    def launch(self, agent):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(orchestrator.shutil, "which", return_value=agent),
+                patch.object(orchestrator, "run_logged") as run,
+            ):
+                final = orchestrator.run_agent(agent, "spec", "Spec", root, root / "spec.log", 60)
+            return run.call_args.args[0], final, root
+
+    def test_codex_spec_is_read_only_and_saves_final_message(self):
+        command, final, root = self.launch("codex")
+        self.assertEqual(["codex", "-a", "never", "exec", "-s", "read-only", "-o", str(final), "-"], command)
+        self.assertEqual(root / "spec-final.md", final)
+
+    def test_claude_spec_cannot_edit_or_run_commands(self):
+        command, final, root = self.launch("claude")
+        self.assertEqual(["claude", "-p", "--permission-mode", "default",
+                          "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"], command)
+        self.assertEqual(root / "spec.log", final)
+
+
+class ApprovalTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
+        subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+                        "commit", "--allow-empty", "-m", "init"], cwd=self.root, check=True, capture_output=True)
+        self.spec = self.root / "docs" / "tasks" / "demo.md"
+        self.spec.parent.mkdir(parents=True)
+        self.spec.write_text("# Demo\n\n## 가정\n- 하나\n\n## 열린 질문\n없음\n", encoding="utf-8")
+
+    def cli(self, *args):
+        return orchestrator.main(list(args), cwd=self.root)
+
+    def approve(self, answer="demo", tty=True, *extra):
+        with patch.object(sys.stdin, "isatty", return_value=tty), \
+                patch("builtins.input", return_value=answer) as asked:
+            return self.cli("approve", "demo", *extra), asked
+
+    def assign(self):
+        return self.cli("assign", "demo", "docs/tasks/demo.md", "codex")
+
+    def test_assign_requires_approval(self):
+        self.assertEqual(1, self.assign())
+        self.assertEqual(0, self.approve()[0])
+        self.assertEqual(0, self.assign())
+
+    def test_approval_needs_a_terminal(self):
+        code, asked = self.approve(tty=False)
+        self.assertEqual(1, code)
+        asked.assert_not_called()
+        self.assertEqual(1, self.assign())
+
+    def test_approval_needs_the_task_id_typed(self):
+        self.assertEqual(1, self.approve(answer="y")[0])
+        self.assertEqual(1, self.assign())
+
+    def test_changed_specification_needs_new_approval(self):
+        self.assertEqual(0, self.approve()[0])
+        self.spec.write_text("# Demo\n\n범위를 넓혔다.\n", encoding="utf-8")
+        self.assertEqual(1, self.assign())
+        self.assertEqual(0, self.approve()[0])
+        self.assertEqual(0, self.assign())
+
+    def test_run_stops_without_approval(self):
+        with patch.object(orchestrator, "run_agent") as agent:
+            code = self.cli("run", "demo", "docs/tasks/demo.md", "codex", "--", sys.executable, "-c", "pass")
+        self.assertEqual(1, code)
+        agent.assert_not_called()
+
+    def test_approve_explicit_path_and_assigned_task(self):
+        other = self.root / "other.md"
+        other.write_text("# Other\n", encoding="utf-8")
+        self.assertEqual(0, self.approve("demo", True, "other.md")[0])
+        self.assertEqual(0, self.cli("assign", "demo", "other.md", "claude"))
+        self.assertEqual(1, self.approve()[0])

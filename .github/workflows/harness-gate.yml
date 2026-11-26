@@ -1,0 +1,22 @@
+name: harness-gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a harness branch
+        if: ${{ !startsWith(github.head_ref, 'harness/') && !contains(github.event.pull_request.labels.*.name, 'harness-maintenance') }}
+        run: |
+          echo "::error::main에는 하네스가 만든 harness/<작업 ID> 브랜치만 머지할 수 있습니다. 하네스 자체 변경은 harness-maintenance 라벨을 붙이세요."
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Harness tests
+        run: python -m unittest discover -s tests

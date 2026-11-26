@@ -1,6 +1,7 @@
 """Local, step-by-step Claude Code and Codex collaboration."""
 
 import argparse
+import hashlib
 import math
 import os
 import re
@@ -24,6 +25,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     reviewed_commit TEXT,
     last_log TEXT,
     last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    spec_path TEXT NOT NULL,
+    spec_hash TEXT NOT NULL,
+    approved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """
 
@@ -73,18 +80,26 @@ def run_logged(command, cwd, log, timeout, prompt=None, env=None):
         raise ValueError(f"{command[0]} exited with code {result.returncode}")
 
 
+READ_ONLY_PHASES = {"review", "spec"}
+
+
 def run_agent(agent, phase, prompt, cwd, log, timeout):
-    review = phase == "review"
+    """Run an agent and return the path of a file holding its final message."""
+    read_only = phase in READ_ONLY_PHASES
     env = None
+    final = log
     if agent == "claude":
-        mode = "plan" if review else "acceptEdits"
         native_claude = Path.home() / ".local" / "bin" / "claude.exe"
         executable = shutil.which("claude") or (str(native_claude) if native_claude.is_file() else "claude")
-        command = [executable, "-p", "--permission-mode", mode]
+        if phase == "spec":
+            command = [executable, "-p", "--permission-mode", "default",
+                       "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"]
+        else:
+            command = [executable, "-p", "--permission-mode", "plan" if read_only else "acceptEdits"]
         if phase == "implement":
             command += ["--allowedTools", "Bash(python -m unittest:*),Bash(python3 -m unittest:*)"]
     else:
-        mode = "read-only" if review else "workspace-write"
+        mode = "read-only" if read_only else "workspace-write"
         executable = shutil.which("codex") or "codex"
         if sys.platform == "win32" and os.environ.get("CODEX_WINDOWS_REGISTERED_CORE") == "1":
             # A Desktop-launched subprocess does not carry the Desktop MSIX identity.
@@ -98,8 +113,37 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
             env = os.environ.copy()
             env.pop("CODEX_WINDOWS_REGISTERED_CORE", None)
             env.pop("CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", None)
-        command = [executable, "-a", "never", "exec", "-s", mode, "-"]
+        command = [executable, "-a", "never", "exec", "-s", mode]
+        if phase == "spec":
+            final = log.with_name(log.stem + "-final.md")
+            command += ["-o", str(final)]
+        command.append("-")
     run_logged(command, cwd, log, timeout, prompt, env=env)
+    return final
+
+
+def extract_spec(text):
+    """Take the specification from the agent's final message: from the first '# ' heading on."""
+    lines = text.strip().splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+    for index, line in enumerate(lines):
+        if line.startswith("# "):
+            return "\n".join(lines[index:]).strip() + "\n"
+    return None
+
+
+def spec_sections(spec, *titles):
+    """Return the named '## ' sections of a specification, in order."""
+    found, current = {}, None
+    for line in spec.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip() if line[3:].strip() in titles else None
+        if current:
+            found.setdefault(current, []).append(line)
+    return "\n".join("\n".join(found[title]).strip() for title in titles if title in found)
 
 
 def commit_changes(worktree, task_id):
@@ -132,12 +176,28 @@ def write_transaction(db):
     db.commit()
 
 
+def spec_hash(spec):
+    return hashlib.sha256(spec.encode("utf-8")).hexdigest()
+
+
+def check_approval(db, task_id, spec, spec_path):
+    """Refuse to start a task whose specification a human has not approved as it is now."""
+    row = db.execute("SELECT spec_hash FROM approvals WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"명세가 승인되지 않았습니다. 사람이 터미널에서 직접 실행해야 합니다:\n"
+                         f"  python -m harness.orchestrator approve {task_id} {spec_path}")
+    if row[0] != spec_hash(spec):
+        raise ValueError(f"승인한 뒤 명세가 바뀌었습니다. 확인하고 다시 승인하세요:\n"
+                         f"  python -m harness.orchestrator approve {task_id} {spec_path}")
+
+
 def assign(db, root, worktree, args):
     if db.execute("SELECT 1 FROM tasks WHERE id = ?", (args.id,)).fetchone():
         raise ValueError(f"Task already assigned: {args.id}")
     spec = (root / args.spec).read_text(encoding="utf-8-sig")
     if not spec.strip():
         raise ValueError("The task specification is empty.")
+    check_approval(db, args.id, spec, args.spec.as_posix())
     base = git(root, "rev-parse", "HEAD")
     git(root, "worktree", "add", "-b", f"harness/{args.id}", str(worktree), base)
     db.execute("INSERT INTO tasks (id, spec, implementer, base) VALUES (?, ?, ?, ?)",
@@ -243,8 +303,10 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=900, help="Step timeout in seconds.")
     subparsers = parser.add_subparsers(dest="action", required=True)
-    for action in ("assign", "status", "implement", "review", "verify", "run", "spec"):
+    for action in ("assign", "status", "implement", "review", "verify", "run", "spec", "approve"):
         subparsers.add_parser(action).add_argument("id")
+    subparsers.choices["approve"].add_argument(
+        "spec", type=Path, nargs="?", help="Specification to approve (default: docs/tasks/<id>.md).")
     for name in ("assign", "run"):
         subparsers.choices[name].add_argument("spec", type=Path)
     subparsers.choices["spec"].add_argument("request", help="Feature request to turn into a task specification.")
@@ -283,7 +345,7 @@ def locate(cwd):
 def read_task(state, task_id):
     with closing(sqlite3.connect(state / "tasks.sqlite3", timeout=30)) as db:
         db.row_factory = sqlite3.Row
-        db.execute(SCHEMA)
+        db.executescript(SCHEMA)
         migrate(db)
         db.commit()
         return db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -335,8 +397,10 @@ def write_spec(args, cwd):
     prompt = template.replace("{task_path}", task_path).replace("{request}", args.request.strip())
 
     def snapshot():
-        return (git(root, "status", "--porcelain", "--untracked-files=all"),
-                git(root, "diff", "--no-ext-diff", "--no-textconv"))
+        # Harness logs live under .harness/; it is gitignored in this repository but may not be elsewhere.
+        status = [line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
+                  if not line[3:].startswith(".harness/")]
+        return status, git(root, "diff", "--no-ext-diff", "--no-textconv")
 
     before = snapshot()
     log = state / "logs" / args.id / f"spec-{uuid4().hex}.log"
@@ -344,30 +408,63 @@ def write_spec(args, cwd):
     log.touch()
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        run_agent(args.agent, "spec", prompt, root, log, args.timeout)
+        final = run_agent(args.agent, "spec", prompt, root, log, args.timeout)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ValueError(f"{exc} (log: {log})") from exc
-    status_before = set(before[0].splitlines())
-    stray = [line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
-             if line not in status_before and not line.endswith(task_path)
-             and not line[3:].startswith(".harness/")]
-    if stray or snapshot()[1] != before[1]:
-        raise ValueError("The agent changed files other than the specification; review with git status "
-                         f"and git diff before continuing. Unexpected: {stray or 'tracked file edits'}")
-    if not target.is_file() or not target.read_text(encoding="utf-8", errors="replace").strip():
-        raise ValueError(f"The agent did not write {task_path}. Log: {log}")
+    # The agent runs read-only; this check is a second line of defence.
+    if snapshot() != before or target.exists():
+        raise ValueError("The agent changed files during the read-only spec step; review with git status "
+                         "and git diff before continuing.")
+    output = Path(final).read_text(encoding="utf-8", errors="replace") if final and Path(final).is_file() else ""
+    spec = extract_spec(output)
+    if spec is None:
+        raise ValueError(f"The agent did not output a specification starting with a '# ' heading. Log: {log}")
+    target.write_text(spec, encoding="utf-8")
     print(f"{args.id}: specification written to {task_path}; log: {log}")
-    print("Review and edit it, then run:\n"
+    if summary := spec_sections(spec, "가정", "열린 질문"):
+        print(summary)
+    print("Review and edit it, approve it yourself, then run:\n"
+          f"  python -m harness.orchestrator approve {args.id}\n"
           f"  python -m harness.orchestrator run {args.id} {task_path} <claude|codex> -- <verification command>")
+    return 0
+
+
+def approve(args, cwd):
+    """A human records approval of the specification as it is now. Agents cannot: it needs a terminal."""
+    root, state = locate(cwd)
+    spec_path = (args.spec or Path("docs") / "tasks" / f"{args.id}.md").as_posix()
+    spec = (root / spec_path).read_text(encoding="utf-8-sig")
+    if not spec.strip():
+        raise ValueError("The task specification is empty.")
+    if not sys.stdin.isatty():
+        raise ValueError("approve는 사람이 터미널에서 직접 실행해야 합니다. 에이전트는 명세를 승인할 수 없습니다.")
+    digest = spec_hash(spec)
+    with closing(sqlite3.connect(state / "tasks.sqlite3", timeout=30)) as db:
+        db.executescript(SCHEMA)
+        migrate(db)
+        db.commit()
+        if db.execute("SELECT 1 FROM tasks WHERE id = ?", (args.id,)).fetchone():
+            raise ValueError(f"Task already assigned: {args.id}")
+        print(f"명세: {spec_path} (sha256 {digest[:12]})")
+        if summary := spec_sections(spec, "가정", "열린 질문"):
+            print(summary)
+        answer = input(f"이 명세대로 구현을 승인하려면 작업 ID({args.id})를 입력하세요: ")
+        if answer.strip() != args.id:
+            raise ValueError("승인하지 않았습니다.")
+        with write_transaction(db):
+            db.execute("INSERT OR REPLACE INTO approvals (id, spec_path, spec_hash) VALUES (?, ?, ?)",
+                       (args.id, spec_path, digest))
+    print(f"{args.id}: approved {spec_path}. 이제 run으로 진행할 수 있습니다.")
     return 0
 
 
 def main(argv=None, cwd=None):
     args = parse_args(argv)
-    if args.action in ("run", "spec"):
+    if args.action in ("run", "spec", "approve"):
+        handler = {"run": run_task, "spec": write_spec, "approve": approve}[args.action]
         try:
-            return run_task(args, cwd) if args.action == "run" else write_spec(args, cwd)
-        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            return handler(args, cwd)
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, EOFError) as exc:
             print(exc, file=sys.stderr)
             return 1
     try:
@@ -375,7 +472,7 @@ def main(argv=None, cwd=None):
         worktree = state / "worktrees" / args.id
         with closing(sqlite3.connect(state / "tasks.sqlite3", timeout=30)) as db:
             db.row_factory = sqlite3.Row
-            db.execute(SCHEMA)
+            db.executescript(SCHEMA)
             migrate(db)
             db.commit()
             if args.action == "assign":

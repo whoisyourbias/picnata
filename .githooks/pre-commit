@@ -1,0 +1,14 @@
+#!/bin/sh
+# main/master 직접 커밋을 막는다. 작업은 하네스가 harness/<작업 ID> 브랜치에 커밋한다.
+# 충돌을 해결한 머지 커밋은 허용한다. 하네스 자체 유지보수는 HARNESS_GUARD=off로 커밋한다.
+branch=$(git symbolic-ref --short -q HEAD)
+case "$branch" in
+  main|master) ;;
+  *) exit 0 ;;
+esac
+[ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ] && exit 0
+[ "$HARNESS_GUARD" = "off" ] && exit 0
+echo "하네스 가드: $branch 에 직접 커밋할 수 없습니다." >&2
+echo "  명세를 쓰고 python -m harness.orchestrator run ... 으로 진행한 뒤 harness/<작업 ID> 브랜치를 머지하세요." >&2
+echo "  하네스 자체 유지보수라면 HARNESS_GUARD=off 로 커밋하세요." >&2
+exit 1

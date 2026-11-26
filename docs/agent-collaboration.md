@@ -266,12 +266,18 @@ python -m harness.orchestrator status add-tests
 
 기능 요청은 먼저 `spec`으로 구체화한다. 에이전트가 `harness/prompts/spec.md` 프롬프트에 따라 저장소를 읽고
 `docs/tasks/<작업 ID>.md`에 목표·범위·동작 명세·완료 조건·검증 명령·가정·열린 질문을 작성한다.
-명세 파일 외의 변경이 있으면 실패한다. 사람은 가정과 열린 질문을 확인·수정한 뒤 `run`으로 넘긴다.
-채팅에서 직접 요청해도 AGENTS.md의 같은 규칙에 따라 에이전트가 명세를 먼저 제시한다.
+이 단계의 에이전트는 읽기 전용으로 실행되고(Claude는 편집·Bash 도구 차단, Codex는 `read-only` 샌드박스), 하네스가 에이전트의 최종 응답을 명세 파일로 저장한다. 저장소에 변경이 생기면 실패한다. 사람은 가정과 열린 질문을 확인·수정한 뒤 `approve`로 승인하고 `run`으로 넘긴다.
+채팅에서 직접 요청해도 AGENTS.md의 같은 규칙에 따라 에이전트가 명세를 먼저 쓰며, 같은 승인 절차를 거친다.
 
 ```powershell
 python -m harness.orchestrator spec add-tests "업로드 이미지 크기를 10MB로 제한하고 싶다" claude
+python -m harness.orchestrator approve add-tests
 ```
+
+`approve`는 명세의 가정과 열린 질문을 보여 주고, 작업 ID를 직접 입력해야 승인한다. 터미널(TTY)이 없으면 거부하므로
+비대화형으로 실행되는 에이전트는 승인할 수 없다. 승인 시점의 명세 해시를 기록하며, `assign`과 `run`은
+승인 기록이 없거나 명세가 승인 후 바뀌었으면 거부한다. 명세를 고쳤다면 다시 `approve`한다.
+기본 경로는 `docs/tasks/<작업 ID>.md`이고, 다른 경로는 `approve <작업 ID> <경로>`로 지정한다.
 
 단계를 한 번에 돌리려면 `run`을 쓴다. 작업이 없으면 `assign`부터 시작하고, 리뷰가 `REQUEST_CHANGES`면
 리뷰 의견을 넣어 다시 구현·리뷰하며, `APPROVE`가 되면 `verify`까지 실행한다.
@@ -302,6 +308,31 @@ python -m harness.orchestrator run add-tests path/to/task.md codex --max-rounds 
   `.harness/tasks.sqlite3`, 로그는 `.harness/logs/<작업 ID>/`에 저장된다.
   실패하면 원인을 해결하고 명령을 다시 실행할 수 있다. 실행 제한은 기본 900초이며
   명령 앞에 `--timeout 1800`처럼 지정한다.
+
+### 하네스 강제 장치
+
+AGENTS.md의 규칙은 권고가 아니라 다음 장치로 강제한다.
+
+| 장치 | 위치 | 막는 것 |
+| --- | --- | --- |
+| 편집 가드 훅 | `.claude/settings.json` → `harness/guard.py` | Claude의 main 체크아웃 편집(`docs/tasks/*.md` 제외), `.harness/` 상태 편집, implement 중이 아닌 worktree 편집 |
+| Bash 가드 | 같은 훅 | Claude의 `approve` 실행, `tasks.sqlite3`를 건드리는 명령 |
+| 읽기 전용 spec | `harness/orchestrator.py` | spec 단계 에이전트의 파일·상태 DB 수정 |
+| 승인 게이트 | `approve` → `assign`/`run` | 사람이 승인하지 않았거나 승인 후 바뀐 명세의 구현 |
+| pre-commit 훅 | `.githooks/pre-commit` | `main`/`master` 직접 커밋(충돌 해결 머지 커밋은 허용) |
+| CI 게이트 | `.github/workflows/harness-gate.yml` | `harness/*`가 아닌 브랜치의 main PR, 하네스 테스트 실패 |
+
+클론마다 한 번 git 훅을 켠다.
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+GitHub 저장소 설정에서 main 브랜치 보호 규칙을 켜고 `harness-gate`를 필수 상태 검사로 지정해야 CI 게이트가 머지를 실제로 막는다.
+
+하네스 자체를 유지보수할 때는 에이전트를 띄우는 셸에서 `HARNESS_GUARD=off`를 설정한다(PowerShell: `$env:HARNESS_GUARD='off'`). PR에는 `harness-maintenance` 라벨을 붙인다.
+
+한계: Bash 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않으며, 쓰기 권한이 있으면 상태 DB의 승인 기록을 위조할 수 있다. 이 경로는 pre-commit 훅과 CI 게이트가 최종적으로 막는다.
 
 **Level 3. Multi-Agent Orchestration**
 
