@@ -654,6 +654,27 @@ class RunTests(GitFlowTestCase):
         self.assertEqual("pass", commits[2]["trailers"]["Harness-Result"])
         self.assertEqual(commits[2]["sha"], run_git(self.origin, "rev-parse", "harness/demo"))
 
+    def test_single_branch_clone_resumes_task_branch_after_main_advanced(self):
+        """A clone tracking only main must start harness/<id> from origin's branch, not origin/main."""
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        implement = run_git(self.origin, "rev-parse", "harness/demo")
+        run_git(self.root, *IDENT, "commit", "--allow-empty", "-m", "main moves on")
+        run_git(self.root, "push", "origin", "main")
+        self.calls.clear()
+        clone_b = self.root.parent / "clone-single"
+        run_git(self.root.parent, "clone", "--single-branch", "--branch", "main", str(self.origin), str(clone_b))
+        self.assertEqual("", run_git(clone_b, "branch", "-r", "--list", "origin/harness/*"))
+        stderr = io.StringIO()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, orchestrator.main(["run", "demo", "codex"], cwd=clone_b), stderr.getvalue())
+        self.assertEqual(["review"], [phase for _, phase, _ in self.calls])
+        commits = list(reversed(orchestrator.read_commits(clone_b / ".harness" / "worktrees" / "demo")))
+        self.assertEqual(["implement", "review", "verify"], [c["trailers"]["Harness-Step"] for c in commits])
+        self.assertEqual(implement, commits[0]["sha"])
+
     def test_diverged_local_and_remote_exits_1_without_agent(self):
         self.complete_run_then_rewind_local()
         (self.worktree / "local.txt").write_text("local", encoding="utf-8")

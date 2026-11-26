@@ -597,7 +597,12 @@ def ensure_worktree(main_root, state, task_id):
         return worktree
     if git_ok(main_root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
         git(main_root, "worktree", "add", str(worktree), branch)
-    elif git_ok(main_root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
+        return worktree
+    # A clone may track only main, so fetch the task branch by name before choosing the start point:
+    # starting a branch that already exists on origin from origin/main would fork its history.
+    if git(main_root, "ls-remote", "--heads", "origin", branch, timeout=300):
+        git(main_root, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=300)
+    if git_ok(main_root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
         git(main_root, "worktree", "add", "-b", branch, str(worktree), f"origin/{branch}")
     else:
         git(main_root, "worktree", "add", "--no-track", "-b", branch, str(worktree), "origin/main")
@@ -787,8 +792,7 @@ def run_task(args, cwd):
         print(f"경고: 로컬 {spec_path}가 origin/main의 명세와 다릅니다. origin/main의 명세를 사용합니다.",
               file=sys.stderr)
     command_text, command = verify_command(spec)
-    worktree = ensure_worktree(main_root, state, args.id)
-    task = Task(args, main_root, state, worktree, spec_path, spec, command_text, command)
+    worktree = task = None
     implements = 0
     while True:
         # Take the task lock before anything can move HEAD: syncing with origin, pushing and planning
@@ -797,6 +801,11 @@ def run_task(args, cwd):
         log = None
         with step_lock(state, args.id, "plan") as lock:
             try:
+                if worktree is None:
+                    # Create the worktree under the lock, so its start point is chosen from origin's
+                    # current task branch and no other runner creates it at the same time.
+                    worktree = ensure_worktree(main_root, state, args.id)
+                    task = Task(args, main_root, state, worktree, spec_path, spec, command_text, command)
                 ensure_clean(worktree)
                 sync_remote(worktree, args.id)
                 # Plan first: plan_next rejects commits without trailers before anything is pushed.
