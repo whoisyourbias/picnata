@@ -91,9 +91,23 @@ def parse_verdict(text):
 
 def review_follow_ups(text):
     """The body of the '## Follow-ups' section of a review, or '' when it is absent or None."""
-    collected, level = [], None
+    collected, level, fence = [], None, None
     for line in text.replace("\r", "").splitlines():
         stripped = line.strip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence is not None:
+            # Inside a fenced code block: '#' lines are code, not headings.
+            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence) \
+                    and not stripped[len(marker.group(1)):].strip():
+                fence = None
+            if level is not None:
+                collected.append(line.rstrip())
+            continue
+        if marker:
+            fence = marker.group(1)
+            if level is not None:
+                collected.append(line.rstrip())
+            continue
         heading = re.fullmatch(r"(#+)\s*(.*?)\s*#*", stripped) if stripped.startswith("#") else None
         if heading:
             depth = len(heading.group(1))

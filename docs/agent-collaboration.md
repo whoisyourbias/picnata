@@ -301,7 +301,7 @@ python -m harness.orchestrator status add-tests
   `VERDICT` 줄이 수와 어긋나면 `리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 수를 따릅니다` 경고를 남기고 수를 따른다.
   review 커밋에는 `Harness-Blocking: <n>`(`MISSING`이면 `?`) 트레일러가 붙는다.
 - 반려되면 이전 리뷰 커밋의 본문이 다음 implement 프롬프트에 들어가고, 구현자는 Blocking 항목만 고치며 후속 과제로 범위를 넓히지 않는다.
-- 후속 과제는 승인을 막지 않는다. 마지막 APPROVE 리뷰의 `## Follow-ups` 절(하위 제목 포함)이 `None`이 아니면 구현 PR 본문 끝에
+- 후속 과제는 승인을 막지 않는다. 마지막 APPROVE 리뷰의 `## Follow-ups` 절(하위 제목과 코드 블록 포함, 코드 블록 안의 `#` 줄은 제목으로 보지 않는다)이 `None`이 아니면 구현 PR 본문 끝에
   `## 후속 과제 (리뷰)` 절로 붙으므로, 사람이 PR에서 보고 별도 작업으로 다룰지 정한다.
 - verify는 마지막 APPROVE 리뷰가 본 커밋과 HEAD의 트리가 같을 때만 실행한다. 실패해도 `Harness-Result: fail` 커밋을 남기고 종료 코드 1로 멈춘다.
   원인을 해결한 뒤 `run`을 다시 실행하면 verify부터 이어진다.

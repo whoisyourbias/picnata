@@ -183,6 +183,16 @@ class ParseVerdictTests(unittest.TestCase):
                                 "### B\n- b\n# Next\n- c"))
         self.assertEqual("- a", follow("## Follow-ups\n- a\n# Top\n- b"))
 
+    def test_review_follow_ups_ignores_headings_inside_code_fences(self):
+        follow = orchestrator.review_follow_ups
+        items = ("- Document setup:\n  ```sh\n  # Install dependencies\n  ## not a heading\n  pip install x\n  ```\n"
+                 "- Rename the helper.")
+        self.assertEqual(items, follow(f"## Blocking\nNone\n\n## Follow-ups\n{items}\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        tilde = "~~~\n# comment\n```\n## still code\n~~~\n- b"
+        self.assertEqual(tilde, follow(f"## Follow-ups\n{tilde}\n## Next\n- c"))
+        # A fence in an earlier section does not hide the Follow-ups heading.
+        self.assertEqual("- a", follow("## Blocking\n```\n# x\n```\n## Follow-ups\n- a\nBLOCKING: 0\nVERDICT: APPROVE"))
+
 class PromptTests(unittest.TestCase):
     def test_review_prompt_states_severity_and_format(self):
         text = orchestrator.REVIEW_INSTRUCTIONS
@@ -491,6 +501,16 @@ class RunTests(GitFlowTestCase):
         self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "pass")], self.steps())
         body = (self.gh_state / "body.md").read_text(encoding="utf-8")
         self.assertIn("## 후속 과제 (리뷰)\n\n- 경계 상황을 더 막자.", body)
+
+    def test_follow_ups_with_code_fences_reach_the_pr_body_intact(self):
+        self.merge_spec()
+        follow_ups = ("- Document setup:\n  ```sh\n  # Install dependencies\n  pip install -r req.txt\n  ```\n"
+                      "- Rename the helper.")
+        review = f"## Blocking\nNone\n\n## Follow-ups\n{follow_ups}\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        body = (self.gh_state / "body.md").read_text(encoding="utf-8")
+        self.assertIn(f"## 후속 과제 (리뷰)\n\n{follow_ups}", body)
 
     def test_missing_blocking_line_records_question_mark(self):
         self.merge_spec()
