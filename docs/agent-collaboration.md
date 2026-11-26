@@ -295,6 +295,9 @@ python -m harness.orchestrator run add-tests path/to/task.md codex --max-rounds 
   명세 내용을 SQLite에 저장한다. 마지막 인자에 `claude` 또는 `codex`를 지정한다.
 - `implement`는 배정된 에이전트를 실행한다. 실행이 끝나면 작업 worktree에 남은 변경을
   하네스가 `harness: implement <task id>` 메시지로 직접 커밋한다. 에이전트가 이미 커밋해 변경이 없으면 커밋하지 않는다.
+  Claude 구현자는 `python -m unittest`와 Gradle(`gradle`, `gradlew`, `backend/gradlew` 및 `.bat` 형태) 명령만 실행할 수 있다(review·spec은 계속 읽기 전용).
+  Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
+  `verify`의 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
 - `review`는 상대 에이전트에 명세와 기준 커밋부터 작업 HEAD까지의 diff를 전달한다.
   리뷰어는 출력 마지막 줄을 `VERDICT: APPROVE` 또는 `VERDICT: REQUEST_CHANGES`로 끝내야 하며,
   하네스가 로그의 마지막 VERDICT 줄을 파싱해 `review_verdict`와 `review_notes`(최대 8000자)에 저장한다.

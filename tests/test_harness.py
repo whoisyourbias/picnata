@@ -113,6 +113,31 @@ class WorkflowTests(unittest.TestCase):
         code = "from pathlib import Path; assert Path('result.txt').read_text() == 'done'"
         self.assertEqual(0, self.cli("verify", "demo", "--", sys.executable, "-c", code))
 
+    def implement_tool(self, agent, phase, prompt, cwd, log, timeout):
+        (cwd / "tools").mkdir()
+        script = cwd / "tools" / "check.cmd"
+        if sys.platform == "win32":
+            script.write_text("@echo ok\r\n", encoding="utf-8")
+        else:
+            script.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            script.chmod(0o755)
+
+    def test_verify_runs_worktree_relative_executable(self):
+        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.implement_tool):
+            self.assertEqual(0, self.cli("implement", "demo"))
+        with patch.object(orchestrator, "run_agent", side_effect=self.review()):
+            self.assertEqual(0, self.cli("review", "demo"))
+        self.assertFalse((self.root / "tools").exists())
+        self.assertEqual(0, self.cli("verify", "demo", "--", "tools/check.cmd"))
+
+    def test_verify_missing_relative_executable_fails(self):
+        self.prepare_reviewed("VERDICT: APPROVE")
+        self.assertEqual(1, self.cli("verify", "demo", "--", "tools/missing.cmd"))
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            error = db.execute("SELECT last_error FROM tasks WHERE id='demo'").fetchone()[0]
+        self.assertIn("Executable not found", error)
+
     def test_verification_rejects_changes_after_review(self):
         self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
         with patch.object(orchestrator, "run_agent", side_effect=self.implement):
@@ -340,6 +365,67 @@ class SpecLaunchTests(unittest.TestCase):
         self.assertEqual(["claude", "-p", "--permission-mode", "default",
                           "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"], command)
         self.assertEqual(root / "spec.log", final)
+
+
+class ImplementPermissionTests(unittest.TestCase):
+    def launch(self, agent, phase):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(orchestrator.shutil, "which", return_value=agent),
+                patch.object(orchestrator, "run_logged") as run,
+            ):
+                orchestrator.run_agent(agent, phase, "Go", root, root / "x.log", 60)
+            return run.call_args.args[0]
+
+    def test_claude_implement_allows_gradle(self):
+        command = self.launch("claude", "implement")
+        allowed = command[command.index("--allowedTools") + 1].split(",")
+        for tool in ["Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)", "Bash(gradle:*)",
+                     "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
+                     "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)",
+                     "Bash(./backend/gradlew:*)"]:
+            self.assertIn(tool, allowed)
+
+    def test_claude_review_has_no_allowed_tools(self):
+        command = self.launch("claude", "review")
+        self.assertNotIn("--allowedTools", command)
+        self.assertEqual("plan", command[command.index("--permission-mode") + 1])
+
+    def test_codex_implement_unchanged(self):
+        self.assertEqual(["codex", "-a", "never", "exec", "-s", "workspace-write", "-"],
+                         self.launch("codex", "implement"))
+
+
+class RelativeExecutableTests(unittest.TestCase):
+    def test_resolves_relative_to_cwd_and_reports_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            tools.mkdir()
+            if sys.platform == "win32":
+                script = tools / "check.cmd"
+                script.write_text("@echo ok\r\n", encoding="utf-8")
+                name = "tools/check.cmd"
+            else:
+                script = tools / "check.sh"
+                script.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+                script.chmod(0o755)
+                name = "tools/check.sh"
+            log = root / "out.log"
+            orchestrator.run_logged([name], root, log, 60)
+            self.assertIn("ok", log.read_text())
+            with self.assertRaisesRegex(FileNotFoundError, "Executable not found"):
+                orchestrator.run_logged(["tools/missing.sh"], root, log, 60)
+            # A relative cwd must not be resolved twice (once by us, once after the subprocess enters cwd).
+            previous = Path.cwd()
+            os.chdir(root.parent)
+            try:
+                log.unlink()
+                orchestrator.run_logged([name], Path(root.name), log, 60)
+            finally:
+                os.chdir(previous)
+            self.assertIn("ok", log.read_text())
 
 
 class ApprovalTests(unittest.TestCase):
