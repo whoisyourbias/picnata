@@ -61,6 +61,8 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
         native_claude = Path.home() / ".local" / "bin" / "claude.exe"
         executable = shutil.which("claude") or (str(native_claude) if native_claude.is_file() else "claude")
         command = [executable, "-p", "--permission-mode", mode]
+        if not review:
+            command += ["--allowedTools", "Bash(python -m unittest:*),Bash(python3 -m unittest:*)"]
     else:
         mode = "read-only" if review else "workspace-write"
         executable = shutil.which("codex") or "codex"
@@ -78,6 +80,14 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
             env.pop("CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", None)
         command = [executable, "-a", "never", "exec", "-s", mode, "-"]
     run_logged(command, cwd, log, timeout, prompt, env=env)
+
+
+def commit_changes(worktree, task_id):
+    if not git(worktree, "status", "--porcelain", "--untracked-files=all"):
+        return
+    git(worktree, "add", "-A")
+    git(worktree, "-c", "user.name=harness", "-c", "user.email=harness@example.invalid",
+        "commit", "-m", f"harness: implement {task_id}")
 
 
 def clean_commit(worktree, base):
@@ -150,11 +160,12 @@ def advance(db, task, worktree, state, args):
             reviewed = None
             prompt = (
                 "Implement the task in this worktree. Read the applicable project instructions. "
-                "Stay on the assigned branch and keep changes local. Commit the completed changes "
-                "if Git permissions and identity allow. Report the changes and checks.\n\n"
+                "Stay on the assigned branch and keep changes local. The harness commits your changes; "
+                "do not run git commit. Report the changes and checks.\n\n"
                 f"Task specification\n{task['spec']}"
             )
             run_agent(task["implementer"], action, prompt, worktree, log, args.timeout)
+            commit_changes(worktree, task["id"])
             phase = "implemented"
         elif action == "review":
             reviewed = None
