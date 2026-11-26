@@ -1,14 +1,20 @@
 import io
 import json
-import sqlite3
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
-from contextlib import closing, redirect_stderr
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import guard, orchestrator
+from harness import guard
+
+
+def run_git(cwd, *args):
+    subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid", *args],
+                   cwd=cwd, check=True, capture_output=True)
 
 
 class GuardTests(unittest.TestCase):
@@ -16,22 +22,19 @@ class GuardTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name).resolve()
-        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
-        subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid",
-                        "commit", "--allow-empty", "-m", "init"], cwd=self.root, check=True, capture_output=True)
-        (self.root / "task.md").write_text("Task", encoding="utf-8")
-        approval = patch.object(orchestrator, "check_approval")
-        approval.start()
-        self.addCleanup(approval.stop)
-        self.assertEqual(0, orchestrator.main(["assign", "demo", "task.md", "codex"], cwd=self.root))
+        run_git(self.root, "init")
+        run_git(self.root, "commit", "--allow-empty", "-m", "init")
         self.worktree = self.root / ".harness" / "worktrees" / "demo"
+        run_git(self.root, "worktree", "add", "-b", "harness/demo", str(self.worktree))
+        self.lock = self.root / ".harness" / "locks" / "demo.json"
 
     def decide(self, path, env=None):
         return guard.decide(str(path), str(self.root), env or {})
 
-    def set_phase(self, phase):
-        with closing(sqlite3.connect(self.root / ".harness" / "tasks.sqlite3")) as db, db:
-            db.execute("UPDATE tasks SET phase=? WHERE id='demo'", (phase,))
+    def set_lock(self, step, pid=None):
+        self.lock.parent.mkdir(parents=True, exist_ok=True)
+        self.lock.write_text(json.dumps({"pid": os.getpid() if pid is None else pid, "step": step}),
+                             encoding="utf-8")
 
     def test_main_checkout_is_blocked_except_task_specs(self):
         self.assertIsNotNone(self.decide(self.root / "src" / "App.java"))
@@ -40,16 +43,26 @@ class GuardTests(unittest.TestCase):
         self.assertIsNotNone(self.decide(self.root / "docs" / "tasks" / "nested" / "x.md"))
 
     def test_harness_state_is_blocked(self):
-        self.assertIsNotNone(self.decide(self.root / ".harness" / "tasks.sqlite3"))
+        self.assertIsNotNone(self.decide(self.root / ".harness" / "locks" / "demo.json"))
         self.assertIsNotNone(self.decide(self.root / ".harness" / "logs" / "demo" / "x.log"))
 
-    def test_worktree_is_editable_only_while_implementing(self):
+    def test_worktree_is_editable_only_while_the_lock_names_implement(self):
         target = self.worktree / "src" / "App.java"
-        self.assertIn("assigned", self.decide(target))
-        self.set_phase("running:implement")
-        self.assertIsNone(self.decide(target))
-        self.set_phase("running:review")
         self.assertIsNotNone(self.decide(target))
+        self.set_lock("implement")
+        self.assertIsNone(self.decide(target))
+        self.set_lock("review")
+        self.assertIsNotNone(self.decide(target))
+        self.set_lock("verify")
+        self.assertIsNotNone(self.decide(target))
+
+    def test_dead_pid_does_not_unlock_the_worktree(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self.set_lock("implement", pid=child.pid)
+        self.assertIsNotNone(self.decide(self.worktree / "src" / "App.java"))
+        self.lock.write_text("not json", encoding="utf-8")
+        self.assertIsNotNone(self.decide(self.worktree / "src" / "App.java"))
 
     def test_override_and_outside_paths(self):
         self.assertIsNone(self.decide(self.root / "AGENTS.md", {"HARNESS_GUARD": "off"}))
@@ -75,22 +88,29 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(0, self.run_hook(allow)[0])
         self.assertEqual(0, self.run_hook({"tool_name": "Read", "tool_input": {"file_path": "x"}})[0])
 
-    def test_bash_cannot_approve_or_touch_state(self):
+    def test_bash_cannot_merge_approve_or_touch_locks(self):
         decide = guard.decide_bash
-        self.assertIsNotNone(decide("python -m harness.orchestrator approve demo", {}))
-        self.assertIsNotNone(decide("cd x && python harness/orchestrator.py approve demo docs/tasks/demo.md", {}))
-        self.assertIsNotNone(decide("sqlite3 .harness/tasks.sqlite3 \"UPDATE tasks SET phase='verified'\"", {}))
-        self.assertIsNotNone(decide("python -m harness.orchestrator --timeout 60 approve demo", {}))
-        self.assertIsNone(decide("python -m harness.orchestrator status demo", {}))
-        self.assertIsNone(decide("python -m harness.orchestrator spec demo \"approve 버튼 추가\" claude", {}))
-        self.assertIsNone(decide("git status", {}))
-        self.assertIsNone(decide("python -m harness.orchestrator approve demo", {"HARNESS_GUARD": "off"}))
+        for command in ("gh pr merge 12 --squash", "cd x && gh pr merge --auto",
+                        "gh -R owner/repo pr merge 3", "gh pr review 4 --approve",
+                        "rm .harness/locks/demo.json", "echo '{}' > .harness\\locks\\demo.json"):
+            with self.subTest(command):
+                self.assertIsNotNone(decide(command, {}))
+                self.assertIsNone(decide(command, {"HARNESS_GUARD": "off"}))
+
+    def test_bash_allows_ordinary_commands(self):
+        decide = guard.decide_bash
+        for command in ("ls", "git status", "gh pr create --base main --head harness/demo",
+                        "gh pr view 12", "gh pr review 4 --comment -b ok",
+                        "python -m harness.orchestrator status demo",
+                        "python -m harness.orchestrator propose demo"):
+            with self.subTest(command):
+                self.assertIsNone(decide(command, {}))
 
     def test_bash_hook_exit_code(self):
-        event = {"tool_name": "Bash", "tool_input": {"command": "python -m harness.orchestrator approve demo"}}
+        event = {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 3"}}
         code, message = self.run_hook(event)
         self.assertEqual(2, code)
-        self.assertIn("approve", message)
+        self.assertIn("머지", message)
         self.assertEqual(0, self.run_hook({"tool_name": "Bash", "tool_input": {"command": "ls"}})[0])
 
 

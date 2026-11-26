@@ -9,14 +9,38 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Require a harness branch
-        if: ${{ !startsWith(github.head_ref, 'harness/') && !contains(github.event.pull_request.labels.*.name, 'harness-maintenance') }}
-        run: |
-          echo "::error::main에는 하네스가 만든 harness/<작업 ID> 브랜치만 머지할 수 있습니다. 하네스 자체 변경은 harness-maintenance 라벨을 붙이세요."
-          exit 1
+      # 검사 코드는 보호된 base 리비전에서 실행하고, PR 내용은 git 객체로만 읽는다.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          path: pr
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Harness gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          # 라벨 이름은 JSON 배열 그대로 다룬다(구분자 문자가 들어간 이름이 다른 라벨로 쪼개지지 않도록).
+          # base 리비전에 harness/gate.py가 아직 없을 수 있으므로(부트스트랩) 라벨은 먼저 확인한다.
+          if [ "$(jq -r 'any(.[]; . == "harness-maintenance")' <<< "$LABELS_JSON")" = "true" ]; then
+            echo "harness-maintenance 라벨: 게이트 통과"
+            exit 0
+          fi
+          args=()
+          while IFS= read -r -d '' label; do
+            args+=(--label "$label")
+          done < <(jq -j '.[] | ., "\u0000"' <<< "$LABELS_JSON")
+          cd trusted
+          python -m harness.gate --repo ../pr --base "$BASE_SHA" --head "$HEAD_SHA" --branch "$HEAD_REF" "${args[@]}"
       - name: Harness tests
+        working-directory: pr
         run: python -m unittest discover -s tests

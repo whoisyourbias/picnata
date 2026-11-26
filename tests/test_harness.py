@@ -1,14 +1,61 @@
+import contextlib
+import io
+import json
 import os
-import sqlite3
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 from harness import orchestrator
+
+REPO = Path(__file__).resolve().parents[1]
+IDENT = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false"]
+
+SPEC = """# 데모 작업
+
+## 목표
+파일을 추가한다.
+
+## 검증 명령
+```
+python -c "from pathlib import Path; assert Path('result.txt').exists()"
+```
+
+## 가정
+- 없음
+
+## 열린 질문
+없음
+"""
+
+FAKE_GH = """import json, os, sys
+state = os.environ["FAKE_GH_STATE"]
+args = sys.argv[1:]
+sys.stdin.read() if not sys.stdin.isatty() and args[:2] == ["pr", "create"] else None
+if args[:1] == ["auth"]:
+    sys.exit(0)
+prs = os.path.join(state, "prs.json")
+if args[:2] == ["pr", "list"]:
+    print(open(prs).read() if os.path.exists(prs) else "[]")
+elif args[:2] == ["pr", "create"]:
+    with open(os.path.join(state, "calls.log"), "a", encoding="utf-8") as log:
+        log.write(" ".join(args) + "\\n")
+    with open(prs, "w") as out:
+        json.dump([{"url": "https://example.invalid/pull/1"}], out)
+    print("https://example.invalid/pull/1")
+"""
+
+
+def run_git(cwd, *args, check=True):
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, encoding="utf-8")
+    if check and result.returncode:
+        raise AssertionError(result.stderr)
+    return result.stdout.strip()
 
 
 class AgentLaunchTests(unittest.TestCase):
@@ -31,457 +78,569 @@ class AgentLaunchTests(unittest.TestCase):
             ):
                 orchestrator.run_agent("codex", "review", "Review", root, root / "review.log", 60)
                 command = run.call_args.args[0]
-                self.assertEqual([str(launcher), "-a", "never", "exec", "-s", "read-only", "-"], command)
+                self.assertEqual([str(launcher), "-a", "never", "exec", "-s", "read-only",
+                                  "-o", str(root / "review-final.md"), "-"], command)
                 child_env = run.call_args.kwargs["env"]
                 self.assertNotIn("CODEX_WINDOWS_REGISTERED_CORE", child_env)
                 self.assertNotIn("CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", child_env)
                 self.assertEqual("1", os.environ["CODEX_WINDOWS_REGISTERED_CORE"])
 
 
-class WorkflowTests(unittest.TestCase):
+class ClaudeFinalResponseTests(unittest.TestCase):
+    def test_claude_stdout_is_captured_apart_from_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log, final = root / "implement.log", root / "implement-final.md"
+            with patch.object(orchestrator, "run_logged") as run:
+                result = orchestrator.run_agent("claude", "implement", "Go", root, log, 60)
+            self.assertEqual(final, result)
+            self.assertEqual(final, run.call_args.kwargs["stdout_path"])
+
+    def test_run_logged_keeps_stderr_out_of_the_final_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = "import sys; print('FINAL'); print('DIAGNOSTIC', file=sys.stderr)"
+            orchestrator.run_logged([sys.executable, "-c", script], root, root / "a.log", 60,
+                                    stdout_path=root / "a-final.md")
+            self.assertEqual("FINAL", (root / "a-final.md").read_text(encoding="utf-8").strip())
+            self.assertNotIn("DIAGNOSTIC", (root / "a-final.md").read_text(encoding="utf-8"))
+            self.assertIn("DIAGNOSTIC", (root / "a.log").read_text(encoding="utf-8"))
+
+
+class SpecParsingTests(unittest.TestCase):
+    def command(self, section):
+        return orchestrator.verify_command(f"# T\n\n## 검증 명령\n{section}\n\n## 가정\n- x\n")[1]
+
+    def test_command_from_code_block(self):
+        self.assertEqual(["python", "-m", "unittest"], self.command("```\npython -m unittest\n```"))
+
+    def test_command_from_first_body_line_without_block(self):
+        self.assertEqual(["python", "-c", "pass"], self.command("`python -c pass`\n두 번째 줄"))
+
+    def test_multiline_code_block_is_one_command(self):
+        self.assertEqual(["python", "-m", "unittest", "-v", "x"],
+                         self.command("```\npython -m unittest \\\n  -v\nx\n```"))
+
+    def test_empty_command_is_an_error(self):
+        with self.assertRaises(ValueError):
+            self.command("```\n```")
+        with self.assertRaises(ValueError):
+            self.command("")
+        with self.assertRaises(ValueError):
+            orchestrator.verify_command("# T\n\n## 목표\nx\n")
+
+
+class LockTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-        self.git("init")
-        self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "commit", "--allow-empty", "-m", "Initial commit")
-        (self.root / "task.md").write_text("Add a file.", encoding="utf-8")
+        self.state = Path(directory.name)
+        self.lock = self.state / "locks" / "demo.json"
+
+    def test_live_pid_is_refused(self):
+        self.lock.parent.mkdir()
+        self.lock.write_text(json.dumps({"pid": os.getpid(), "step": "implement"}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "이미 실행 중"):
+            with orchestrator.step_lock(self.state, "demo", "review"):
+                pass
+        self.assertTrue(self.lock.exists())
+
+    def test_dead_pid_is_reclaimed_and_lock_removed_afterwards(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self.lock.parent.mkdir()
+        self.lock.write_text(json.dumps({"pid": child.pid, "step": "implement"}), encoding="utf-8")
+        with orchestrator.step_lock(self.state, "demo", "verify"):
+            info = json.loads(self.lock.read_text(encoding="utf-8"))
+            self.assertEqual((os.getpid(), "verify"), (info["pid"], info["step"]))
+            self.assertIn("started", info)
+        self.assertFalse(self.lock.exists())
+
+    def test_concurrent_reclaim_admits_only_one(self):
+        import threading
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self.lock.parent.mkdir()
+        self.lock.write_text(json.dumps({"pid": child.pid, "step": "implement"}), encoding="utf-8")
+        inside, refused, barrier = [], [], threading.Barrier(4)
+
+        def worker():
+            barrier.wait()
+            try:
+                with orchestrator.step_lock(self.state, "demo", "implement"):
+                    inside.append(1)
+                    time.sleep(0.3)
+            except ValueError:
+                refused.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(1, len(inside))
+        self.assertEqual(3, len(refused))
+
+    def test_creation_waits_for_the_reclaim_mutex(self):
+        """A runner must not touch the lock while another holder has the OS mutex, however long it takes."""
+        import threading
+        self.lock.parent.mkdir()
+        mutex = self.lock.with_suffix(".reclaim")
+        entered = []
+
+        def worker():
+            with orchestrator.step_lock(self.state, "demo", "implement"):
+                entered.append(time.time())
+
+        with orchestrator.os_mutex(mutex):
+            # Even a mutex file that looks ancient must not be taken over from a live holder.
+            os.utime(mutex, (0, 0))
+            thread = threading.Thread(target=worker)
+            thread.start()
+            time.sleep(0.4)
+            self.assertEqual([], entered)
+            released = time.time()
+        thread.join(10)
+        self.assertEqual(1, len(entered))
+        self.assertGreaterEqual(entered[0], released)
+        self.assertFalse(self.lock.exists())
+
+    def test_lock_is_removed_on_exception(self):
+        with self.assertRaises(RuntimeError):
+            with orchestrator.step_lock(self.state, "demo", "review"):
+                raise RuntimeError
+        self.assertFalse(self.lock.exists())
+
+
+class CliTests(unittest.TestCase):
+    def test_removed_subcommands_are_rejected(self):
+        for name in ("assign", "implement", "review", "verify", "approve"):
+            with self.subTest(name), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    orchestrator.main([name, "demo"])
+                self.assertEqual(2, raised.exception.code)
+                self.assertIn("invalid choice", stderr.getvalue())
+
+    def test_no_sqlite_in_harness_code_or_docs(self):
+        for path in (REPO / "harness").glob("*.py"):
+            self.assertNotIn("sqlite3", path.read_text(encoding="utf-8"), path.name)
+        for name in ("AGENTS.md", "docs/agent-collaboration.md"):
+            text = (REPO / name).read_text(encoding="utf-8")
+            self.assertNotIn("sqlite", text.lower(), name)
+            # The review verdict APPROVE stays; the removed approve subcommand must not.
+            self.assertNotIn("approve", text, name)
+
+
+class GitFlowTestCase(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name).resolve()
+        self.origin = base / "origin.git"
+        self.root = base / "main"
+        self.gh_state = base / "gh"
+        self.gh_state.mkdir()
+        run_git(base, "init", "--bare", str(self.origin))
+        run_git(base, "init", str(self.root))
+        run_git(self.root, "symbolic-ref", "HEAD", "refs/heads/main")
+        run_git(self.root, *IDENT, "commit", "--allow-empty", "-m", "Initial commit")
+        run_git(self.root, "remote", "add", "origin", str(self.origin))
+        run_git(self.root, "push", "origin", "main")
+        run_git(self.origin, "symbolic-ref", "HEAD", "refs/heads/main")
         self.state = self.root / ".harness"
         self.worktree = self.state / "worktrees" / "demo"
-        # The approval gate has its own tests; workflow tests start from an approved specification.
-        approval = patch.object(orchestrator, "check_approval")
-        approval.start()
-        self.addCleanup(approval.stop)
+        self.spec_path = self.root / "docs" / "tasks" / "demo.md"
+        self.set_spec(SPEC)
+        self.install_fake_gh(base)
+        self.calls = []
 
-    def git(self, *args, cwd=None):
-        subprocess.run(["git", *args], cwd=cwd or self.root, check=True,
-                       capture_output=True)
+    def install_fake_gh(self, base):
+        bin_dir = base / "bin"
+        bin_dir.mkdir()
+        script = bin_dir / "fake_gh.py"
+        script.write_text(FAKE_GH, encoding="utf-8")
+        if os.name == "nt":
+            (bin_dir / "gh.cmd").write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        else:
+            launcher = bin_dir / "gh"
+            launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+            launcher.chmod(0o755)
+        env = patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                                      "FAKE_GH_STATE": str(self.gh_state)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def set_spec(self, text):
+        self.spec_path.parent.mkdir(parents=True, exist_ok=True)
+        self.spec_path.write_text(text, encoding="utf-8")
+
+    def merge_spec(self):
+        """Simulate the specification PR being merged into main."""
+        run_git(self.root, "add", "docs/tasks/demo.md")
+        run_git(self.root, *IDENT, "commit", "-m", "spec")
+        run_git(self.root, "push", "origin", "main")
 
     def cli(self, *args):
-        return orchestrator.main(list(args), cwd=self.root)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            code = orchestrator.main(list(args), cwd=self.root)
+        self.stderr = stderr.getvalue()
+        return code
 
-    def implement(self, agent, phase, prompt, cwd, log, timeout):
-        self.assertEqual(("codex", "implement", self.worktree), (agent, phase, cwd))
-        (cwd / "result.txt").write_text("done", encoding="utf-8")
-        self.git("add", "result.txt", cwd=cwd)
-        self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "commit", "-m", "Implement", cwd=cwd)
+    def branch_commits(self):
+        return list(reversed(orchestrator.read_commits(self.worktree)))
 
-    def implement_uncommitted(self, agent, phase, prompt, cwd, log, timeout):
-        (cwd / "result.txt").write_text("done", encoding="utf-8")
+    def steps(self):
+        return [(c["trailers"]["Harness-Step"], c["trailers"].get("Harness-Verdict")
+                 or c["trailers"].get("Harness-Result")) for c in self.branch_commits()]
 
-    def test_harness_commits_uncommitted_agent_changes(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement_uncommitted):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertEqual("", orchestrator.git(self.worktree, "status", "--porcelain", "--untracked-files=all"))
-        self.assertEqual("harness: implement demo", orchestrator.git(self.worktree, "log", "-1", "--format=%s"))
-        self.assertEqual("harness", orchestrator.git(self.worktree, "log", "-1", "--format=%an"))
-        with patch.object(orchestrator, "run_agent"):
-            self.assertEqual(0, self.cli("review", "demo"))
+    def agent(self, verdicts=("APPROVE",), crash_review=False):
+        """A fake agent: implement writes result.txt, review answers from the verdict list."""
+        reviews = iter(verdicts)
 
-    def test_no_extra_commit_when_agent_already_committed(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertEqual("Implement", orchestrator.git(self.worktree, "log", "-1", "--format=%s"))
-        self.assertEqual("2", orchestrator.git(self.worktree, "rev-list", "--count", "HEAD"))
-
-    def review(self, verdict_text="VERDICT: APPROVE"):
         def run(agent, phase, prompt, cwd, log, timeout):
-            log.write_text(f"Findings here.\n{verdict_text}\n", encoding="utf-8")
+            self.calls.append((agent, phase, prompt))
+            if phase == "implement":
+                (Path(cwd) / "result.txt").write_text(f"round {len(self.calls)}", encoding="utf-8")
+                log.write_text("RAW LOG NOISE\n", encoding="utf-8")
+                final = log.with_name(log.stem + "-final.md")
+                final.write_text("구현을 마쳤습니다.", encoding="utf-8")
+                return final
+            if crash_review:
+                raise ValueError("agent crashed")
+            log.write_text(f"Fix the thing.\nVERDICT: {next(reviews)}\n", encoding="utf-8")
         return run
 
-    def prepare_reviewed(self, verdict_text):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.review(verdict_text)):
-            self.assertEqual(0, self.cli("review", "demo"))
 
-    def test_cross_review_and_verification(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertFalse((self.root / "result.txt").exists())
-        with patch.object(orchestrator, "run_agent", side_effect=self.review()) as agent:
-            self.assertEqual(0, self.cli("review", "demo"))
-            self.assertEqual(("claude", "review"), agent.call_args.args[:2])
-            self.assertIn("+done", agent.call_args.args[2])
-        self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "raise SystemExit(7)"))
-        code = "from pathlib import Path; assert Path('result.txt').read_text() == 'done'"
-        self.assertEqual(0, self.cli("verify", "demo", "--", sys.executable, "-c", code))
+class ProposeTests(GitFlowTestCase):
+    def test_open_questions_block_propose(self):
+        self.set_spec(SPEC.replace("## 열린 질문\n없음", "## 열린 질문\n- 무엇을?"))
+        self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertIn("열린 질문이 남아 있습니다. 사용자와 정리한 뒤 다시 propose 하세요.", self.stderr)
+        self.assertEqual("", run_git(self.origin, "branch", "--list", "spec/demo"))
 
-    def implement_tool(self, agent, phase, prompt, cwd, log, timeout):
-        (cwd / "tools").mkdir()
-        script = cwd / "tools" / "check.cmd"
-        if sys.platform == "win32":
-            script.write_text("@echo ok\r\n", encoding="utf-8")
-        else:
-            script.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
-            script.chmod(0o755)
+    def test_missing_or_empty_spec_is_rejected(self):
+        self.spec_path.write_text("  \n", encoding="utf-8")
+        self.assertEqual(1, self.cli("propose", "demo"))
+        self.spec_path.unlink()
+        self.assertEqual(1, self.cli("propose", "demo"))
 
-    def test_verify_runs_worktree_relative_executable(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement_tool):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.review()):
-            self.assertEqual(0, self.cli("review", "demo"))
-        self.assertFalse((self.root / "tools").exists())
-        self.assertEqual(0, self.cli("verify", "demo", "--", "tools/check.cmd"))
+    def test_propose_pushes_one_file_on_top_of_origin_main(self):
+        before = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "status", "--porcelain"),
+                  run_git(self.root, "ls-files"), run_git(self.root, "symbolic-ref", "HEAD"),
+                  self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        after = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "status", "--porcelain"),
+                 run_git(self.root, "ls-files"), run_git(self.root, "symbolic-ref", "HEAD"),
+                 self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, after)
+        main = run_git(self.origin, "rev-parse", "main")
+        self.assertEqual(main, run_git(self.origin, "rev-parse", "spec/demo^"))
+        self.assertEqual("docs/tasks/demo.md", run_git(self.origin, "diff", "--name-only", main, "spec/demo"))
+        message = run_git(self.origin, "log", "-1", "--format=%B", "spec/demo")
+        self.assertTrue(message.startswith("spec(demo): 데모 작업\n\nHarness-Task: demo"))
+        self.assertEqual("harness", run_git(self.origin, "log", "-1", "--format=%an", "spec/demo"))
+        self.assertIn("pr create --base main --head spec/demo --title spec: 데모 작업",
+                      (self.gh_state / "calls.log").read_text(encoding="utf-8"))
 
-    def test_verify_missing_relative_executable_fails(self):
-        self.prepare_reviewed("VERDICT: APPROVE")
-        self.assertEqual(1, self.cli("verify", "demo", "--", "tools/missing.cmd"))
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            error = db.execute("SELECT last_error FROM tasks WHERE id='demo'").fetchone()[0]
-        self.assertIn("Executable not found", error)
+    def test_existing_pr_is_not_duplicated(self):
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        calls = (self.gh_state / "calls.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(1, len(calls))
 
-    def test_verification_rejects_changes_after_review(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.review()):
-            self.assertEqual(0, self.cli("review", "demo"))
-        (self.worktree / "result.txt").write_text("changed", encoding="utf-8")
-        self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "pass"))
+    def test_already_approved_spec_is_rejected(self):
+        self.merge_spec()
+        self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertIn("이미", self.stderr)
 
-    def test_failed_implementation_can_be_retried(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=FileNotFoundError("codex")):
-            self.assertEqual(1, self.cli("implement", "demo"))
-        self.assertEqual(1, self.cli("review", "demo"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
-            self.assertEqual(0, self.cli("implement", "demo"))
-
-    def test_other_tasks_and_duplicate_runs_while_agent_runs(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        results = {}
-
-        def busy(agent, phase, prompt, cwd, log, timeout):
-            results["assign"] = self.cli("assign", "other", "task.md", "claude")
-            results["status"] = self.cli("status", "other")
-            results["same"] = self.cli("implement", "demo")
-            self.implement(agent, phase, prompt, cwd, log, timeout)
-
-        with patch.object(orchestrator, "run_agent", side_effect=busy):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertEqual(0, results["assign"])
-        self.assertEqual(0, results["status"])
-        self.assertEqual(1, results["same"])
-
-    def test_other_task_can_implement_while_agent_runs(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        self.assertEqual(0, self.cli("assign", "other", "task.md", "codex"))
-        results = {}
-
-        def busy(agent, phase, prompt, cwd, log, timeout):
-            if cwd.name == "demo":
-                results["other"] = self.cli("implement", "other")
-                with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-                    results["phase"] = db.execute("SELECT phase FROM tasks WHERE id='demo'").fetchone()[0]
-
-        with patch.object(orchestrator, "run_agent", side_effect=busy):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertEqual(0, results["other"])
-        self.assertEqual("running:implement", results["phase"])
-
-    def test_failure_restores_previous_phase(self):
-        self.assertEqual(0, self.cli("assign", "demo", "task.md", "codex"))
-        with patch.object(orchestrator, "run_agent", side_effect=self.implement):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        with patch.object(orchestrator, "run_agent", side_effect=OSError("boom")):
-            self.assertEqual(1, self.cli("review", "demo"))
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            self.assertEqual(("implemented", "boom"), db.execute(
-                "SELECT phase, last_error FROM tasks WHERE id='demo'").fetchone())
-
-    def test_verify_rejected_when_review_requests_changes(self):
-        self.prepare_reviewed("VERDICT: REQUEST_CHANGES")
-        self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "pass"))
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            row = db.execute("SELECT phase, review_verdict FROM tasks").fetchone()
-        self.assertEqual(("reviewed", "REQUEST_CHANGES"), row)
-
-    def test_reimplement_prompt_includes_previous_findings(self):
-        self.prepare_reviewed("VERDICT: REQUEST_CHANGES")
-        prompts = []
-
-        def capture(agent, phase, prompt, cwd, log, timeout):
-            prompts.append(prompt)
-        with patch.object(orchestrator, "run_agent", side_effect=capture):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertIn("Previous review findings", prompts[0])
-        self.assertIn("Findings here.", prompts[0])
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            row = db.execute("SELECT reviewed_commit, review_verdict FROM tasks").fetchone()
-        self.assertEqual((None, "REQUEST_CHANGES"), row)
-
-    def test_approved_review_is_not_added_to_implement_prompt(self):
-        self.prepare_reviewed("VERDICT: APPROVE")
-        prompts = []
-        with patch.object(orchestrator, "run_agent",
-                          side_effect=lambda *a: prompts.append(a[2])):
-            self.assertEqual(0, self.cli("implement", "demo"))
-        self.assertNotIn("Previous review findings", prompts[0])
-
-    def test_missing_verdict_line_means_request_changes(self):
-        self.prepare_reviewed("No verdict given.")
-        self.assertEqual(1, self.cli("verify", "demo", "--", sys.executable, "-c", "pass"))
-
-    def test_parse_verdict(self):
-        parse = orchestrator.parse_verdict
-        self.assertEqual("APPROVE", parse("ok\nVERDICT: APPROVE\n"))
-        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVE\nVERDICT: REQUEST_CHANGES"))
-        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVE\nVERDICT: MAYBE"))
-        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVE or VERDICT: REQUEST_CHANGES"))
-        self.assertEqual("REQUEST_CHANGES", parse("VERDICT: APPROVED"))
-        self.assertEqual("REQUEST_CHANGES", parse(""))
-
-    def test_old_schema_database_is_migrated(self):
-        self.state.mkdir()
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db, db:
-            db.execute("""CREATE TABLE tasks (id TEXT PRIMARY KEY, spec TEXT NOT NULL,
-                implementer TEXT NOT NULL, base TEXT NOT NULL,
-                phase TEXT NOT NULL DEFAULT 'assigned', reviewed_commit TEXT,
-                last_log TEXT, last_error TEXT)""")
-            db.execute("INSERT INTO tasks (id, spec, implementer, base) VALUES ('old', 's', 'codex', 'b')")
-        self.assertEqual(0, self.cli("status", "old"))
-        self.assertEqual(0, self.cli("status", "old"))
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
-            row = db.execute("SELECT review_verdict, review_notes FROM tasks").fetchone()
-        self.assertTrue({"review_verdict", "review_notes"} <= columns)
-        self.assertEqual((None, None), row)
-
-    def run_agent_script(self, verdicts):
-        calls, answers = [], iter(verdicts)
-
-        def agent(name, phase, prompt, cwd, log, timeout):
-            calls.append((name, phase))
-            if phase == "implement":
-                (cwd / "result.txt").write_text(f"v{len(calls)}", encoding="utf-8")
-            else:
-                log.write_text(f"Finding.\n{next(answers)}\n", encoding="utf-8")
-        return calls, agent
-
-    def test_run_reworks_until_review_approves_then_verifies(self):
-        calls, agent = self.run_agent_script(["VERDICT: REQUEST_CHANGES", "VERDICT: APPROVE"])
-        with patch.object(orchestrator, "run_agent", side_effect=agent):
-            code = self.cli("run", "demo", "task.md", "codex", "--", sys.executable, "-c", "pass")
-        self.assertEqual(0, code)
-        self.assertEqual([("codex", "implement"), ("claude", "review")] * 2, calls)
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            self.assertEqual("verified", db.execute("SELECT phase FROM tasks").fetchone()[0])
-        with patch.object(orchestrator, "run_agent") as agent_again:
-            self.assertEqual(0, self.cli("run", "demo", "task.md", "codex", "--", sys.executable, "-c", "pass"))
-        agent_again.assert_not_called()
-
-    def test_run_stops_for_human_after_max_rounds(self):
-        calls, agent = self.run_agent_script(["VERDICT: REQUEST_CHANGES"] * 2)
-        with patch.object(orchestrator, "run_agent", side_effect=agent):
-            code = self.cli("--timeout", "60", "run", "demo", "task.md", "codex", "--max-rounds", "2",
-                            "--", sys.executable, "-c", "pass")
-        self.assertEqual(1, code)
-        self.assertEqual(2, [phase for _, phase in calls].count("implement"))
-        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
-            self.assertEqual(("reviewed", "REQUEST_CHANGES"),
-                             tuple(db.execute("SELECT phase, review_verdict FROM tasks").fetchone()))
-
-    def test_run_requires_verification_command(self):
-        with self.assertRaises(SystemExit):
-            self.cli("run", "demo", "task.md", "codex")
-
-    def spec_agent(self, output, seen=None, side=None):
-        def agent(name, phase, prompt, cwd, log, timeout):
-            if seen is not None:
-                seen.update(name=name, phase=phase, prompt=prompt, cwd=cwd)
-            if side:
-                side(cwd)
-            log.write_text(output, encoding="utf-8")
-            return log
-        return agent
-
-    def test_spec_runs_agent_with_template_and_request(self):
-        seen = {}
-        output = "명세입니다.\n# Login\n\n## 가정\n- 이메일 로그인\n\n## 열린 질문\n없음\n"
-        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent(output, seen)):
-            self.assertEqual(0, self.cli("spec", "login", "로그인 기능 {request} 추가", "claude"))
-        self.assertEqual(("claude", "spec", self.root.resolve()), (seen["name"], seen["phase"], seen["cwd"].resolve()))
-        self.assertIn("로그인 기능 {request} 추가", seen["prompt"])
-        self.assertIn("docs/tasks/login.md", seen["prompt"])
-        self.assertNotIn("{task_path}", seen["prompt"])
-        written = (self.root / "docs" / "tasks" / "login.md").read_text(encoding="utf-8")
-        self.assertTrue(written.startswith("# Login\n"))
-        with patch.object(orchestrator, "run_agent") as again:
-            self.assertEqual(1, self.cli("spec", "login", "다시", "claude"))
-        again.assert_not_called()
-
-    def test_spec_rejects_changes_outside_the_specification(self):
-        def side(cwd):
-            (cwd / "extra.py").write_text("print()", encoding="utf-8")
-
-        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent("# Login\n", side=side)):
-            self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
-        self.assertFalse((self.root / "docs" / "tasks" / "login.md").exists())
-
-    def test_spec_rejects_agent_writing_the_specification_itself(self):
-        def side(cwd):
-            (cwd / "docs" / "tasks" / "login.md").write_text("# Login\n", encoding="utf-8")
-
-        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent("# Login\n", side=side)):
-            self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
-
-    def test_spec_fails_when_agent_outputs_no_specification(self):
-        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent("명세를 못 썼습니다.")):
-            self.assertEqual(1, self.cli("spec", "login", "로그인", "codex"))
-        self.assertFalse((self.root / "docs" / "tasks" / "login.md").exists())
-
-    def test_extract_spec(self):
-        self.assertEqual("# A\nbody\n", orchestrator.extract_spec("```markdown\n# A\nbody\n```"))
-        self.assertEqual("# A\n", orchestrator.extract_spec("요약\n# A"))
-        self.assertIsNone(orchestrator.extract_spec("## only a section"))
+    def test_without_gh_the_branch_is_still_pushed(self):
+        with patch.object(orchestrator, "gh_available", return_value=None):
+            self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertIn("gh를 설치하고 gh auth login 하세요", self.stderr)
+        self.assertIn("spec/demo", run_git(self.origin, "branch", "--list", "spec/demo"))
 
 
-class SpecLaunchTests(unittest.TestCase):
-    def launch(self, agent):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with (
-                patch.object(orchestrator.shutil, "which", return_value=agent),
-                patch.object(orchestrator, "run_logged") as run,
-            ):
-                final = orchestrator.run_agent(agent, "spec", "Spec", root, root / "spec.log", 60)
-            return run.call_args.args[0], final, root
+class RunTests(GitFlowTestCase):
+    def run_cli(self, *extra):
+        return self.cli("run", "demo", "codex", *extra)
 
-    def test_codex_spec_is_read_only_and_saves_final_message(self):
-        command, final, root = self.launch("codex")
-        self.assertEqual(["codex", "-a", "never", "exec", "-s", "read-only", "-o", str(final), "-"], command)
-        self.assertEqual(root / "spec-final.md", final)
-
-    def test_claude_spec_cannot_edit_or_run_commands(self):
-        command, final, root = self.launch("claude")
-        self.assertEqual(["claude", "-p", "--permission-mode", "default",
-                          "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"], command)
-        self.assertEqual(root / "spec.log", final)
-
-
-class ImplementPermissionTests(unittest.TestCase):
-    def launch(self, agent, phase):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with (
-                patch.object(orchestrator.shutil, "which", return_value=agent),
-                patch.object(orchestrator, "run_logged") as run,
-            ):
-                orchestrator.run_agent(agent, phase, "Go", root, root / "x.log", 60)
-            return run.call_args.args[0]
-
-    def test_claude_implement_allows_gradle(self):
-        command = self.launch("claude", "implement")
-        allowed = command[command.index("--allowedTools") + 1].split(",")
-        for tool in ["Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)", "Bash(gradle:*)",
-                     "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
-                     "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)",
-                     "Bash(./backend/gradlew:*)"]:
-            self.assertIn(tool, allowed)
-
-    def test_claude_review_has_no_allowed_tools(self):
-        command = self.launch("claude", "review")
-        self.assertNotIn("--allowedTools", command)
-        self.assertEqual("plan", command[command.index("--permission-mode") + 1])
-
-    def test_codex_implement_unchanged(self):
-        self.assertEqual(["codex", "-a", "never", "exec", "-s", "workspace-write", "-"],
-                         self.launch("codex", "implement"))
-
-
-class RelativeExecutableTests(unittest.TestCase):
-    def test_resolves_relative_to_cwd_and_reports_missing(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            tools = root / "tools"
-            tools.mkdir()
-            if sys.platform == "win32":
-                script = tools / "check.cmd"
-                script.write_text("@echo ok\r\n", encoding="utf-8")
-                name = "tools/check.cmd"
-            else:
-                script = tools / "check.sh"
-                script.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
-                script.chmod(0o755)
-                name = "tools/check.sh"
-            log = root / "out.log"
-            orchestrator.run_logged([name], root, log, 60)
-            self.assertIn("ok", log.read_text())
-            with self.assertRaisesRegex(FileNotFoundError, "Executable not found"):
-                orchestrator.run_logged(["tools/missing.sh"], root, log, 60)
-            # A relative cwd must not be resolved twice (once by us, once after the subprocess enters cwd).
-            previous = Path.cwd()
-            os.chdir(root.parent)
-            try:
-                log.unlink()
-                orchestrator.run_logged([name], Path(root.name), log, 60)
-            finally:
-                os.chdir(previous)
-            self.assertIn("ok", log.read_text())
-
-
-class ApprovalTests(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
-        subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid",
-                        "commit", "--allow-empty", "-m", "init"], cwd=self.root, check=True, capture_output=True)
-        self.spec = self.root / "docs" / "tasks" / "demo.md"
-        self.spec.parent.mkdir(parents=True)
-        self.spec.write_text("# Demo\n\n## 가정\n- 하나\n\n## 열린 질문\n없음\n", encoding="utf-8")
-
-    def cli(self, *args):
-        return orchestrator.main(list(args), cwd=self.root)
-
-    def approve(self, answer="demo", tty=True, *extra):
-        with patch.object(sys.stdin, "isatty", return_value=tty), \
-                patch("builtins.input", return_value=answer) as asked:
-            return self.cli("approve", "demo", *extra), asked
-
-    def assign(self):
-        return self.cli("assign", "demo", "docs/tasks/demo.md", "codex")
-
-    def test_assign_requires_approval(self):
-        self.assertEqual(1, self.assign())
-        self.assertEqual(0, self.approve()[0])
-        self.assertEqual(0, self.assign())
-
-    def test_approval_needs_a_terminal(self):
-        code, asked = self.approve(tty=False)
-        self.assertEqual(1, code)
-        asked.assert_not_called()
-        self.assertEqual(1, self.assign())
-
-    def test_approval_needs_the_task_id_typed(self):
-        self.assertEqual(1, self.approve(answer="y")[0])
-        self.assertEqual(1, self.assign())
-
-    def test_changed_specification_needs_new_approval(self):
-        self.assertEqual(0, self.approve()[0])
-        self.spec.write_text("# Demo\n\n범위를 넓혔다.\n", encoding="utf-8")
-        self.assertEqual(1, self.assign())
-        self.assertEqual(0, self.approve()[0])
-        self.assertEqual(0, self.assign())
-
-    def test_run_stops_without_approval(self):
+    def test_unapproved_spec_exits_with_3(self):
         with patch.object(orchestrator, "run_agent") as agent:
-            code = self.cli("run", "demo", "docs/tasks/demo.md", "codex", "--", sys.executable, "-c", "pass")
-        self.assertEqual(1, code)
-        agent.assert_not_called()
+            self.assertEqual(3, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("명세 PR(spec/demo)이 아직 머지되지 않았습니다.", self.stderr)
+        self.assertFalse(self.worktree.exists())
 
-    def test_approve_explicit_path_and_assigned_task(self):
-        other = self.root / "other.md"
-        other.write_text("# Other\n", encoding="utf-8")
-        self.assertEqual(0, self.approve("demo", True, "other.md")[0])
-        self.assertEqual(0, self.cli("assign", "demo", "other.md", "claude"))
-        self.assertEqual(1, self.approve()[0])
+    def test_wait_times_out_with_3(self):
+        with patch.object(orchestrator, "WAIT_INTERVAL", 0.05):
+            self.assertEqual(3, self.run_cli("--wait", "0.1"))
+
+    def test_full_flow_commits_trailers_and_pushes(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent",
+                          side_effect=self.agent(("REQUEST_CHANGES", "APPROVE"))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertEqual([("implement", None), ("review", "REQUEST_CHANGES"), ("implement", None),
+                          ("review", "APPROVE"), ("verify", "pass")], self.steps())
+        commits = self.branch_commits()
+        rounds = [c["trailers"].get("Harness-Round") for c in commits]
+        self.assertEqual(["1", None, "2", None, None], rounds)
+        self.assertEqual(commits[0]["sha"], commits[1]["trailers"]["Harness-Reviewed"])
+        self.assertEqual(commits[2]["sha"], commits[3]["trailers"]["Harness-Reviewed"])
+        self.assertEqual(commits[2]["sha"], commits[4]["trailers"]["Harness-Verified"])
+        self.assertEqual(["codex", "claude", "codex", "claude"], [call[0] for call in self.calls])
+        self.assertEqual(["codex", "claude", "codex", "claude"],
+                         [c["trailers"]["Harness-Agent"] for c in commits[:4]])
+        self.assertTrue(commits[0]["message"].startswith("harness(demo): implement round 1\n\n구현을 마쳤습니다."))
+        self.assertNotIn("RAW LOG NOISE", commits[0]["message"])
+        self.assertIn("Fix the thing.", commits[1]["message"])
+        self.assertTrue(commits[4]["message"].startswith("harness(demo): verify pass"))
+        self.assertIn("Harness-Command: python -c", commits[4]["message"])
+        # The next implement round sees the review findings from the review commit.
+        self.assertIn("Previous review findings\nFix the thing.", self.calls[2][2])
+        for commit in commits:
+            self.assertEqual("harness", run_git(self.worktree, "log", "-1", "--format=%an", commit["sha"]))
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"),
+                         run_git(self.origin, "rev-parse", "harness/demo"))
+        self.assertIn("pr create --base main --head harness/demo --title 데모 작업",
+                      (self.gh_state / "calls.log").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "locks" / "demo.json").exists())
+        self.assertFalse((self.state / "tasks.sqlite3").exists())
+
+    def test_rerun_after_completion_only_opens_the_pr_once(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(0, self.run_cli(), self.stderr)
+            agent.assert_not_called()
+        self.assertEqual(1, len((self.gh_state / "calls.log").read_text(encoding="utf-8").splitlines()))
+
+    def test_run_resumes_from_stage_computed_from_trailers(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        self.assertEqual([("implement", None)], self.steps())
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertEqual(["review"], [call[1] for call in self.calls])
+        self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "pass")], self.steps())
+
+    def test_commit_without_trailers_stops_the_run(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        run_git(self.worktree, *IDENT, "commit", "--allow-empty", "-m", "manual change")
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(1, self.run_cli())
+        self.assertEqual([], self.calls)
+        self.assertIn("트레일러 없는 커밋", self.stderr)
+
+    def test_uncommitted_changes_stop_the_run(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        (self.worktree / "stray.txt").write_text("x", encoding="utf-8")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(1, self.run_cli())
+        self.assertIn("커밋 안 된 변경", self.stderr)
+
+    def test_failed_verification_leaves_a_fail_commit(self):
+        self.set_spec(SPEC.replace("assert Path('result.txt').exists()", "raise SystemExit(7)"))
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(1, self.run_cli())
+        self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "fail")], self.steps())
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+        self.assertFalse((self.gh_state / "calls.log").exists())
+        # A failing verify is re-run, not skipped.
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertEqual("fail", self.steps()[-1][1])
+        self.assertEqual(4, len(self.steps()))
+
+    def test_missing_verify_command_fails_before_any_work(self):
+        self.set_spec(SPEC.replace("```\npython -c \"from pathlib import Path; assert Path('result.txt').exists()\"\n```", ""))
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertFalse(self.worktree.exists())
+
+    def test_live_lock_refuses_the_run(self):
+        self.merge_spec()
+        (self.state / "locks").mkdir(parents=True)
+        (self.state / "locks" / "demo.json").write_text(
+            json.dumps({"pid": os.getpid(), "step": "implement"}), encoding="utf-8")
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("이미 실행 중", self.stderr)
+
+    def test_live_lock_is_reported_even_while_the_worktree_is_dirty(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        (self.worktree / "half-written.txt").write_text("x", encoding="utf-8")
+        (self.state / "locks").mkdir(parents=True, exist_ok=True)
+        (self.state / "locks" / "demo.json").write_text(
+            json.dumps({"pid": os.getpid(), "step": "implement"}), encoding="utf-8")
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("이미 실행 중", self.stderr)
+        self.assertNotIn("커밋 안 된 변경", self.stderr)
+
+    def test_rerun_after_the_pr_is_merged_does_nothing(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        run_git(self.root, "fetch", "origin")
+        run_git(self.root, *IDENT, "merge", "--no-ff", "-m", "merge", "origin/harness/demo")
+        run_git(self.root, "push", "origin", "main")
+        with patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(0, self.run_cli(), self.stderr)
+            agent.assert_not_called()
+        self.assertEqual(1, len((self.gh_state / "calls.log").read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(3, len(orchestrator.read_commits(self.worktree, merged_task="demo")))
+
+    def test_trailer_keeps_inner_spaces_of_the_command(self):
+        command = 'python -c "print(\'a  b\')"'
+        message = orchestrator.build_message("s", "body", [("Harness-Command", command), ("Harness-Task", "a\nb")])
+        trailers = orchestrator.parse_trailers(message)
+        self.assertEqual(command, trailers["Harness-Command"])
+        self.assertEqual("a b", trailers["Harness-Task"])
+
+    def test_stale_plan_is_not_executed(self):
+        """Another run advanced the branch between planning and taking the lock."""
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        real_lock = orchestrator.step_lock
+
+        @contextlib.contextmanager
+        def racing_lock(state, task_id, step):
+            with real_lock(state, task_id, step) as path:
+                orchestrator.harness_commit(self.worktree, orchestrator.build_message(
+                    "harness(demo): review APPROVE", "", [("Harness-Task", "demo"), ("Harness-Step", "review"),
+                                                          ("Harness-Reviewed", "0" * 40),
+                                                          ("Harness-Verdict", "APPROVE")]))
+                yield path
+
+        with patch.object(orchestrator, "step_lock", racing_lock), \
+                patch.object(orchestrator, "run_agent") as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("다른 실행이 단계를 진행했습니다", self.stderr)
+
+    def test_raw_log_is_never_committed_when_final_response_is_missing(self):
+        self.merge_spec()
+
+        def agent(name, phase, prompt, cwd, log, timeout):
+            log.write_text("SECRET-RAW-LOG\n", encoding="utf-8")
+            (Path(cwd) / "result.txt").write_text("x", encoding="utf-8")
+            final = log.with_name(log.stem + "-final.md")
+            final.write_text("", encoding="utf-8")
+            if phase == "implement":
+                return final
+            raise ValueError("stop after implement")
+
+        with patch.object(orchestrator, "run_agent", side_effect=agent):
+            self.assertEqual(1, self.run_cli())
+        self.assertNotIn("SECRET-RAW-LOG", run_git(self.worktree, "log", "--format=%B", "origin/main..HEAD"))
+        self.assertNotIn("SECRET-RAW-LOG", run_git(self.origin, "log", "--format=%B", "harness/demo"))
+
+    def test_pending_commit_is_pushed_before_the_next_phase(self):
+        self.merge_spec()
+        real_push = orchestrator.push_branch
+
+        def failing_push(worktree, task_id):
+            raise ValueError("push 실패 (커밋은 로컬에 남았습니다): offline")
+
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                patch.object(orchestrator, "push_branch", failing_push):
+            self.assertEqual(1, self.run_cli())
+        self.assertEqual([("implement", None)], self.steps())
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent, \
+                patch.object(orchestrator, "push_branch", failing_push):
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        # Once the remote is back, the pending commit is published and the run continues.
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()), \
+                patch.object(orchestrator, "push_branch", real_push):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+
+    def test_tree_changed_during_verify_is_not_recorded_as_pass(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("REQUEST_CHANGES", "APPROVE"))):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+
+        def tamper(command, cwd, log, timeout, **kwargs):
+            (self.worktree / "late.txt").write_text("late", encoding="utf-8")
+
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("APPROVE",))), \
+                patch.object(orchestrator, "run_logged", tamper):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+        self.assertNotIn("verify", [step for step, _ in self.steps()])
+
+    def test_rerun_after_completion_needs_no_push(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        with patch.object(orchestrator, "push_branch", side_effect=ValueError("offline")):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+
+    def test_resume_reviews_with_counterpart_of_the_implementer(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())  # codex implemented
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.cli("run", "demo", "claude"), self.stderr)
+        self.assertEqual([("claude", "review")], [(call[0], call[1]) for call in self.calls])
+
+    def test_status_keeps_history_after_the_branch_is_merged(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        run_git(self.root, "fetch", "origin")
+        run_git(self.root, *IDENT, "merge", "--no-ff", "-m", "merge", "origin/harness/demo")
+        run_git(self.root, "push", "origin", "main")
+        self.assertEqual("", run_git(self.root, "log", "origin/main..origin/harness/demo"))
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, orchestrator.main(["status", "demo"], cwd=self.root))
+        self.assertIn("next step: done", stdout.getvalue())
+        self.assertIn("last verdict: APPROVE", stdout.getvalue())
+
+    def test_status_reads_stage_from_git(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, orchestrator.main(["status", "demo"], cwd=self.root))
+        text = stdout.getvalue()
+        self.assertRegex(text, r"next step: review")
+        self.assertIn("pushed: yes", text)
+        self.assertIn("pr: -", text)
+        # A fresh clone without the local branch still sees the history on origin.
+        run_git(self.root, "worktree", "remove", "--force", str(self.worktree))
+        run_git(self.root, "branch", "-D", "harness/demo")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, orchestrator.main(["status", "demo"], cwd=self.root))
+        self.assertRegex(stdout.getvalue(), r"next step: review")
+        self.assertIn("pushed: yes", stdout.getvalue())
+        self.assertFalse((self.state / "tasks.sqlite3").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
