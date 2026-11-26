@@ -65,12 +65,12 @@ VERDICT_MISMATCH = "경고: 리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 
 
 def parse_review(text):
     """(verdict, blocking count) from the last two lines after trailing blank lines are removed:
-    BLOCKING: <n> immediately followed by VERDICT: <...>.
+    BLOCKING: <n> immediately followed by VERDICT: <...>, matched verbatim (no surrounding spaces).
 
     The count decides the verdict; a disagreeing VERDICT line only triggers a warning.
     Anything else is ("MISSING", None)."""
-    lines = [line.strip() for line in text.splitlines()]
-    while lines and not lines[-1]:
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
         lines.pop()
     if len(lines) < 2 or lines[-1] not in ("VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES"):
         return "MISSING", None
