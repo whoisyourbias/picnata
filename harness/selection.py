@@ -17,8 +17,16 @@ TIERS = ("light", "general", "advanced")
 def task_tier(text):
     if re.search(r"recovery|rollback|concurren|locking|state transitions?|복구|동시성|상태 전이|잠금", text, re.I):
         return "advanced"
-    if re.search(r"문서|설명|document|readme", text, re.I) and not re.search(
-            r"implement|add tests|validation|구현한다|검증 로직|테스트를 추가", text, re.I):
+    # Only lower the starting model when every requested action is document work.
+    actions = [part.strip(" #-*.\t") for part in re.split(
+        r"[\n;!?]+|\.(?:\s+|$)|\band\b|하고\s+|하며\s+", text, flags=re.I) if part.strip(" #-*.\t")]
+    document_action = (
+        r"(?:update|edit|revise|write)\s+(?:the\s+)?(?:api\s+)?(?:docs?\b|documentation\b|readme\b)"
+        r"|(?:reflect|copy|record)\b.*\b(?:in|into|to)\s+(?:the\s+)?(?:docs?|documentation|readme)\b"
+        r"|(?:document|describe)\s+"
+        r"|.*(?:문서|README)(?:에|를|을|의|로|만|\s).*?(?:반영|옮|기록|정리|갱신|수정|설명|작성)"
+    )
+    if actions and all(re.match(document_action, action, re.I) for action in actions):
         return "light"
     return "general"
 

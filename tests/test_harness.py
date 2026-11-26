@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from harness import orchestrator, selection
@@ -90,6 +91,10 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(expected, result.agent if result else None)
 
     def test_effort_policy_and_usage_timeout(self):
+        for request in ("회원 가입 API를 추가하고 응답 필드를 설명한다",
+                        "Update the README and add a signup endpoint"):
+            self.assertEqual("general", selection.task_tier(request))
+        self.assertEqual("light", selection.task_tier("확정된 API 필드 설명을 문서에 반영한다"))
         for text, levels, expected in [
                 ("Reflect decided API fields in documentation", ["low", "high"], "low"),
                 ("API 경계값 테스트", ["minimal", "low", "medium"], "low"),
@@ -122,6 +127,20 @@ class SelectionTests(unittest.TestCase):
         for reason in ("authentication", "quota exceeded", "environment error"):
             self.assertFalse(orchestrator.unresolved(f"UNRESOLVED: {reason}\nEVIDENCE: command failed"))
 
+    def test_escalation_belongs_to_stage_that_reported_the_issue(self):
+        task = orchestrator.Task(SimpleNamespace(id="demo", agent="auto", timeout=1),
+                                 None, None, None, None, SPEC, None, None)
+        for reporting in ("review", "implement"):
+            commits = []
+            for phase, agent in (("review", "claude"), ("implement", "codex")):
+                body = "UNRESOLVED: duplicate dispatch\nEVIDENCE: race after retry" if phase == reporting else "ok"
+                commits.append({"trailers": {"Harness-Step": phase, "Harness-Agent": agent},
+                                "message": "subject\n\n" + body})
+            with patch.object(selection, "select"):
+                for phase in ("implement", "review"):
+                    task.prepare(phase, commits, None)
+                    self.assertEqual(phase == reporting, task.raised)
+
     def test_inapplicable_or_incomplete_model_limits_hold_auto(self):
         item = {"model": "model", "limitId": "special"}
         base = {"primary": {"usedPercent": 80, "resetsAt": 1000}}
@@ -135,7 +154,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_auto_cli_emits_final_response_and_usage_with_configured_effort(self):
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
+            root = Path(root) / "first-task"
+            root.mkdir()
             for agent in ("claude", "codex"):
                 choice = selection.Candidate(agent, "test-model", "medium", 50, 1000, (2000,))
                 log = root / f"{agent}.log"
@@ -159,11 +179,14 @@ class SelectionTests(unittest.TestCase):
                         orchestrator, "agent_runtime", return_value=(agent, None)):
                     final = orchestrator.run_agent(agent, "review", "review", root, log, 10, choice)
                 self.assertEqual("final", final.read_text(encoding="utf-8"))
+            other = root.parent / "second-task"
+            other.mkdir()
+            (other / "review.json").write_bytes((root / "codex.json").read_bytes())
             orchestrator.verification_metrics([], root / "verify-result.log", "pass")
             summary = json.loads((root / "verify-result.json").read_text(encoding="utf-8"))
             self.assertTrue(summary["first_verification_passed"])
             for group in summary["local_attempts"]:
-                self.assertEqual(100, group["tokens"]["input_tokens"])
+                self.assertEqual(200 if group["agent"] == "codex" else 100, group["tokens"]["input_tokens"])
                 self.assertIsNone(group["tokens"]["reasoning_output_tokens"])
             self.assertEqual(2, len(summary["local_attempts"]))
 
@@ -489,6 +512,24 @@ class ProposeTests(GitFlowTestCase):
 class RunTests(GitFlowTestCase):
     def run_cli(self, *extra):
         return self.cli("run", "demo", "codex", *extra)
+
+    def test_quota_stop_saves_applicable_binary_patch(self):
+        self.merge_spec()
+        def interrupt(agent, phase, prompt, cwd, log, timeout, choice):
+            (cwd / "partial.bin").write_bytes(bytes(range(256)))
+            (cwd / "docs/tasks/demo.md").unlink()
+            raise orchestrator.QuotaReached("quota exhausted")
+
+        choice = selection.Candidate("codex", "model", "low", 50, 0, ())
+        with patch.object(selection, "select", return_value=choice), patch.object(
+                orchestrator, "run_agent", side_effect=interrupt):
+            self.assertEqual(1, self.cli("run", "demo", "auto"))
+        self.assertEqual("", run_git(self.worktree, "status", "--porcelain"))
+        self.assertEqual("", run_git(self.worktree, "stash", "list"))
+        snapshot, = (self.state / "logs/demo").glob("*.patch")
+        run_git(self.worktree, "apply", str(snapshot))
+        self.assertEqual(bytes(range(256)), (self.worktree / "partial.bin").read_bytes())
+        self.assertFalse((self.worktree / "docs/tasks/demo.md").exists())
 
     def test_unapproved_spec_exits_with_3(self):
         with patch.object(orchestrator, "run_agent") as agent:

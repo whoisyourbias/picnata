@@ -222,7 +222,7 @@ def record_attempt(agent, log, final, stdout_path, started):
 def verification_metrics(commits, log, result):
     """Pool attempts by provider and task tier, keeping token components separate."""
     groups = {}
-    for path in log.parent.glob("*.json"):
+    for path in log.parent.parent.glob("*/*.json"):
         if path.suffixes[-2:] == [".result", ".json"] or path.stem.startswith("verify-"):
             continue
         try:
@@ -817,10 +817,9 @@ class Task:
         if step == "review":
             fixed = OTHER_AGENT[fixed]
         previous_phase = next((c for c in commits if c["trailers"].get("Harness-Step") == step), None)
-        last_findings = message_body(commits[0]["message"]) if commits else ""
         self.raised = bool(previous_phase and (
             previous_phase["trailers"].get("Harness-Raised") == "true" or
-            unresolved(message_body(previous_phase["message"])) or unresolved(last_findings)))
+            unresolved(message_body(previous_phase["message"]))))
         task_text = section_body(self.spec, "목표") or self.spec
         task_text += "\n" + (section_body(self.spec, "동작 명세") or "")
         prior_review = next((c for c in commits if c["trailers"].get("Harness-Step") == "review"), None)
@@ -854,8 +853,10 @@ class Task:
                 final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout, choice)
             except QuotaReached:
                 if git(self.worktree, "status", "--porcelain"):
-                    git(self.worktree, "stash", "push", "--include-untracked", "-m",
-                        f"harness/{self.id} partial quota-limited attempt {log.stem}")
+                    git(self.worktree, "add", "-A")
+                    git(self.worktree, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv",
+                        "--output", str(log.with_suffix(".patch").resolve()), "HEAD", "--")
+                    git(self.worktree, "restore", "--source=HEAD", "--staged", "--worktree", "--", ".")
                 raise
         else:
             final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
