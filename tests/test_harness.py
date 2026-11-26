@@ -1171,5 +1171,169 @@ class RunTests(GitFlowTestCase):
         self.assertFalse((self.state / "tasks.sqlite3").exists())
 
 
+class AdoptTests(GitFlowTestCase):
+    HINT = "사람이 한 수정이면 --adopt로 이어받을 수 있습니다."
+
+    def run_cli(self, agent="codex", *extra):
+        return self.cli("run", "demo", agent, *extra)
+
+    def human_commit(self, name="human.txt", text="human fix", subject="human fix"):
+        path = self.worktree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        run_git(self.worktree, "add", "-A")
+        run_git(self.worktree, *IDENT, "commit", "-m", subject)
+        return run_git(self.worktree, "rev-parse", "HEAD")
+
+    def after_request_changes(self):
+        """implement -> review REQUEST_CHANGES; the run stops at --max-rounds 1."""
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("REQUEST_CHANGES",))):
+            self.assertEqual(1, self.run_cli("codex", "--max-rounds", "1"))
+        self.calls.clear()
+
+    def after_implement(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(crash_review=True)):
+            self.assertEqual(1, self.run_cli())
+        self.calls.clear()
+
+    def harness_steps(self):
+        return [(c["trailers"].get("Harness-Step"), c["trailers"].get("Harness-Agent"))
+                for c in self.branch_commits()]
+
+    def adopt_commits(self):
+        return [c for c in self.branch_commits() if "Harness-Adopted" in c["trailers"]]
+
+    def status_text(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, orchestrator.main(["status", "demo"], cwd=self.root))
+        return stdout.getvalue()
+
+    def test_without_adopt_trailerless_commit_is_refused_with_hint(self):
+        self.after_implement()
+        self.human_commit()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(1, self.run_cli())
+        self.assertEqual([], self.calls)
+        self.assertIn("마지막 하네스 커밋 뒤에 트레일러 없는 커밋이 있습니다", self.stderr)
+        self.assertIn(self.HINT, self.stderr)
+        self.assertEqual([], self.adopt_commits())
+
+    def test_adopt_after_request_changes_reaches_the_pr_within_max_rounds_1(self):
+        self.after_request_changes()
+        human = self.human_commit()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("APPROVE",))):
+            self.assertEqual(0, self.run_cli("codex", "--adopt", "--max-rounds", "1"), self.stderr)
+        self.assertEqual([("claude", "review")], [(call[0], call[1]) for call in self.calls])
+        self.assertEqual([("implement", "codex"), ("review", "claude"), (None, None), ("implement", "human"),
+                          ("review", "claude"), ("verify", None)], self.harness_steps())
+        commits = self.branch_commits()
+        adopt = commits[3]
+        self.assertEqual({"Harness-Task": "demo", "Harness-Step": "implement", "Harness-Agent": "human",
+                          "Harness-Round": "2", "Harness-Adopted": f"{human}..{human}"}, adopt["trailers"])
+        self.assertTrue(adopt["message"].startswith("harness(demo): adopt human commits\n\n"
+                                                    f"{human[:12]} Test human fix\n\n"))
+        self.assertEqual("harness", run_git(self.worktree, "log", "-1", "--format=%an", adopt["sha"]))
+        self.assertTrue(orchestrator.trees_equal(self.worktree, human, adopt["sha"]))
+        self.assertEqual(adopt["sha"], commits[4]["trailers"]["Harness-Reviewed"])
+        self.assertEqual("pass", commits[5]["trailers"]["Harness-Result"])
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+        self.assertIn("pr create --base main --head harness/demo",
+                      (self.gh_state / "calls.log").read_text(encoding="utf-8"))
+        self.assertIn(f"adopted {human}..{human}", (self.gh_state / "body.md").read_text(encoding="utf-8"))
+        # The CI gate accepts the branch: verify pass, matching tree, APPROVE review of that tree.
+        from harness import gate
+        base = run_git(self.worktree, "rev-parse", "origin/main")
+        self.assertEqual([], gate.check(self.worktree, base, "HEAD", "harness/demo"))
+        self.assertIn(f"adopted: {human}..{human} (round 2)", self.status_text())
+
+    def test_adopt_on_a_branch_without_harness_commits_is_round_1(self):
+        self.merge_spec()
+        orchestrator.ensure_worktree(self.root, self.state, "demo")
+        human = self.human_commit("result.txt", "by hand")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
+        adopt = self.adopt_commits()
+        self.assertEqual(1, len(adopt))
+        self.assertEqual("1", adopt[0]["trailers"]["Harness-Round"])
+        self.assertEqual(f"{human}..{human}", adopt[0]["trailers"]["Harness-Adopted"])
+        self.assertEqual([("claude", "review")], [(call[0], call[1]) for call in self.calls])
+
+    def test_several_human_commits_are_listed_in_order(self):
+        self.after_implement()
+        shas = [self.human_commit(f"h{i}.txt", str(i), f"human change {i}") for i in range(3)]
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
+        adopt = self.adopt_commits()[0]
+        self.assertEqual(f"{shas[0]}..{shas[2]}", adopt["trailers"]["Harness-Adopted"])
+        self.assertEqual("2", adopt["trailers"]["Harness-Round"])
+        self.assertEqual("\n".join(f"{sha[:12]} Test human change {i}" for i, sha in enumerate(shas)),
+                         orchestrator.message_body(adopt["message"]))
+
+    def test_adopted_round_is_reviewed_by_the_other_agent(self):
+        for agent, reviewer in (("claude", "codex"), ("codex", "claude")):
+            with self.subTest(agent=agent):
+                self.setUp()
+                self.after_implement()
+                self.human_commit()
+                with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+                    self.assertEqual(0, self.run_cli(agent, "--adopt"), self.stderr)
+                self.assertEqual([(reviewer, "review")], [(call[0], call[1]) for call in self.calls])
+                review = next(c for c in reversed(self.branch_commits())
+                              if c["trailers"].get("Harness-Step") == "review")
+                self.assertEqual(reviewer, review["trailers"]["Harness-Agent"])
+
+    def assert_refused(self, expected=None):
+        head = run_git(self.worktree, "rev-parse", "HEAD")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(1, self.run_cli("codex", "--adopt"))
+        self.assertEqual([], self.calls)
+        self.assertEqual(head, run_git(self.worktree, "rev-parse", "HEAD"))
+        self.assertEqual([], self.adopt_commits())
+        if expected:
+            self.assertIn(expected, self.stderr)
+
+    def test_merge_commit_is_refused(self):
+        self.after_implement()
+        run_git(self.worktree, "switch", "-q", "-c", "side")
+        self.human_commit("side.txt", "side")
+        run_git(self.worktree, "switch", "-q", "harness/demo")
+        self.human_commit("main.txt", "main")
+        run_git(self.worktree, *IDENT, "merge", "--no-ff", "-m", "merge side", "side")
+        self.assert_refused("머지 커밋")
+
+    def test_spec_change_is_refused(self):
+        self.after_implement()
+        self.human_commit("docs/tasks/demo.md", SPEC + "\n바꾼 명세\n")
+        self.assert_refused("명세")
+
+    def test_interleaved_harness_commit_is_refused(self):
+        self.after_implement()
+        self.human_commit("a.txt", "a")
+        orchestrator.harness_commit(self.worktree, orchestrator.build_message(
+            "harness(demo): implement round 2", "", [("Harness-Task", "demo"), ("Harness-Step", "implement"),
+                                                     ("Harness-Agent", "codex"), ("Harness-Round", 2)]))
+        self.human_commit("b.txt", "b")
+        self.assert_refused("끼어")
+
+    def test_reverted_change_is_refused(self):
+        self.after_implement()
+        self.human_commit("a.txt", "a")
+        run_git(self.worktree, *IDENT, "revert", "--no-edit", "HEAD")
+        self.assert_refused("이어받을 변경이 없습니다")
+
+    def test_adopt_without_human_commits_changes_nothing(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("REQUEST_CHANGES", "APPROVE"))):
+            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
+        self.assertEqual([("implement", "codex"), ("review", "claude"), ("implement", "codex"),
+                          ("review", "claude"), ("verify", None)], self.harness_steps())
+        self.assertEqual([], self.adopt_commits())
+        self.assertNotIn("adopted", self.stdout)
+        self.assertNotIn("adopted:", self.status_text())
+
+
 if __name__ == "__main__":
     unittest.main()

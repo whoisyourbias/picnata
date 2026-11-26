@@ -287,6 +287,26 @@ python -m harness.orchestrator status add-tests
   `harness/<작업 ID>` 브랜치와 `.harness/worktrees/<작업 ID>` worktree를 `origin/main`에서 만들고, 이미 있으면 이어서 진행한다.
 - 단계는 브랜치에서 `origin/main` 이후 `Harness-Step` 트레일러가 있는 마지막 커밋으로 계산한다. 중간에 멈췄다면 같은 명령을 다시 실행한다.
   트레일러 없는 커밋이 끼어 있거나 worktree에 커밋 안 된 변경이 있으면 오류로 멈춘다.
+- 구현 에이전트가 쓸 수 없는 파일(예: `.claude/settings.json`)은 사람이 `harness/<작업 ID>` 브랜치에 직접 커밋한 뒤
+  `run <작업 ID> <claude|codex> --adopt`로 이어받는다. 잠금과 원격 동기화 뒤, 마지막 하네스 커밋(없으면 `origin/main`) 뒤의
+  트레일러 없는 커밋을 하네스 작성자의 빈 기록 커밋 하나로 새 implement 라운드에 편입한다.
+  ```
+  harness(<작업 ID>): adopt human commits
+
+  <이어받은 커밋마다 "<짧은 SHA> <작성자 이름> <제목>">
+
+  Harness-Task: <작업 ID>
+  Harness-Step: implement
+  Harness-Agent: human
+  Harness-Round: <이전 최대 round + 1, 하네스 커밋이 없으면 1>
+  Harness-Adopted: <이어받은 첫 커밋 SHA>..<이어받은 마지막 커밋 SHA>
+  ```
+  기록 커밋을 push한 뒤 review → verify → 구현 PR로 이어진다. 리뷰어는 `run`에 준 에이전트의 반대쪽이다.
+  기록 커밋은 트리를 바꾸지 않으므로 리뷰가 승인하고 verify가 검증하는 트리에 사람의 변경이 포함되며, CI 게이트는 바뀌지 않는다.
+  이어받기는 `--max-rounds`에 세지 않는다. 이어받을 커밋이 없으면 `--adopt`는 아무것도 하지 않는다.
+  다음 경우에는 기록 커밋을 만들지 않고 종료 코드 1로 멈춘다: 머지 커밋이 있다, 승인된 명세 `docs/tasks/<작업 ID>.md`를 수정한다,
+  트레일러 없는 커밋 사이에 하네스 커밋이 끼어 있다(연속 구간이 아니다), 되돌림 등으로 변경이 없다(`이어받을 변경이 없습니다`).
+  작성자는 검증하지 않으므로 사람이 PR에서 본문 목록의 작성자를 확인한다. `--adopt` 없이 트레일러 없는 커밋이 있으면 지금처럼 거부하고 `--adopt` 안내를 덧붙인다.
 - 모든 하네스 커밋의 작성자는 `harness <harness@example.invalid>`이다. implement는 에이전트의 최종 응답, review는 리뷰어 출력,
   verify는 검증 명령 출력의 마지막 100줄을 본문(최대 8000자)에 남긴다. 에이전트 원본 로그는 `.harness/logs/<작업 ID>/`(로컬)에만 있다.
   Claude 구현자는 `python -m unittest`와 Gradle(`gradle`, `gradlew`, `backend/gradlew` 및 `.bat` 형태) 명령만 실행할 수 있다(review·spec은 읽기 전용).
@@ -326,6 +346,7 @@ python -m harness.orchestrator status add-tests
 - `--max-rounds`(기본 3)는 이번 실행의 implement 횟수 상한이다. 상한까지 반려되면 멈추고 사람에게 넘긴다. 실행 제한은 기본 900초이며
   `--timeout 1800`처럼 하위 명령 앞에 지정한다.
 - `status <작업 ID>`는 git에서 계산한 단계·round·마지막 판정, 브랜치와 push 여부, 구현 PR URL, worktree, 마지막 로컬 로그를 보여 준다.
+  이어받은 라운드가 있으면 `adopted: <첫 SHA>..<마지막 SHA> (round <n>)` 줄을 더한다.
 
 ### 잠금
 
