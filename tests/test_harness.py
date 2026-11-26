@@ -36,7 +36,10 @@ python -c "from pathlib import Path; assert Path('result.txt').exists()"
 FAKE_GH = """import json, os, sys
 state = os.environ["FAKE_GH_STATE"]
 args = sys.argv[1:]
-sys.stdin.read() if not sys.stdin.isatty() and args[:2] == ["pr", "create"] else None
+body = sys.stdin.buffer.read().decode("utf-8") if args[:2] == ["pr", "create"] else None
+if body is not None:
+    with open(os.path.join(state, "body.md"), "w", encoding="utf-8") as out:
+        out.write(body)
 if args[:1] == ["auth"]:
     sys.exit(0)
 prs = os.path.join(state, "prs.json")
@@ -131,14 +134,54 @@ class SpecParsingTests(unittest.TestCase):
 
 
 class ParseVerdictTests(unittest.TestCase):
-    def test_last_line_decides(self):
-        parse = orchestrator.parse_verdict
-        self.assertEqual("APPROVE", parse("좋습니다.\nVERDICT: APPROVE"))
-        self.assertEqual("APPROVE", parse("좋습니다.\n  VERDICT: APPROVE  \n\n\n"))
-        self.assertEqual("REQUEST_CHANGES", parse("문제\nVERDICT: REQUEST_CHANGES\n"))
-        self.assertEqual("MISSING", parse("VERDICT: APPROVE\n그러나 버그가 있습니다."))
-        self.assertEqual("MISSING", parse("VERDICT: APPROVE please"))
-        self.assertEqual("MISSING", parse(""))
+    def parse(self, text):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = orchestrator.parse_verdict(text)
+        return verdict, stderr.getvalue()
+
+    def test_blocking_count_decides(self):
+        cases = [
+            ("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE", "APPROVE", False),
+            ("좋습니다.\nBLOCKING: 0\nVERDICT: REQUEST_CHANGES", "APPROVE", True),
+            ("문제\nBLOCKING: 2\nVERDICT: APPROVE", "REQUEST_CHANGES", True),
+            ("문제\nBLOCKING: 1\nVERDICT: REQUEST_CHANGES\n", "REQUEST_CHANGES", False),
+            ("좋습니다.\nVERDICT: APPROVE", "MISSING", False),
+            ("좋습니다.\n  BLOCKING: 0  \n  VERDICT: APPROVE  \n\n\n", "APPROVE", False),
+            ("BLOCKING: -1\nVERDICT: APPROVE", "MISSING", False),
+            ("BLOCKING: x\nVERDICT: APPROVE", "MISSING", False),
+            ("BLOCKING: 0\nVERDICT: APPROVE\n그러나 버그가 있습니다.", "MISSING", False),
+            ("BLOCKING: 0\nVERDICT: APPROVE please", "MISSING", False),
+            ("VERDICT: APPROVE\nBLOCKING: 0", "MISSING", False),
+            ("", "MISSING", False),
+        ]
+        for text, expected, warns in cases:
+            with self.subTest(text=text):
+                verdict, stderr = self.parse(text)
+                self.assertEqual(expected, verdict)
+                if warns:
+                    self.assertIn("리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 수를 따릅니다", stderr)
+                else:
+                    self.assertEqual("", stderr)
+
+    def test_follow_ups_section(self):
+        follow = orchestrator.review_follow_ups
+        review = "## Blocking\nNone\n\n## Follow-ups\n- 이름을 바꾸자.\n- 문서를 다듬자.\n\nBLOCKING: 0\nVERDICT: APPROVE"
+        self.assertEqual("- 이름을 바꾸자.\n- 문서를 다듬자.", follow(review))
+        self.assertEqual("", follow("## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("", follow("좋습니다.\nBLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("- a", follow("## Follow-ups\n- a\n## Other\n- b"))
+
+
+class PromptTests(unittest.TestCase):
+    def test_review_prompt_states_severity_and_format(self):
+        text = orchestrator.REVIEW_INSTRUCTIONS
+        for phrase in ("Blocking:", "Follow-up:", "If you are unsure, classify the finding as Follow-up",
+                       "`## Blocking`", "`## Follow-ups`", "`None`",
+                       "BLOCKING: <number of blocking findings>\nVERDICT: <APPROVE|REQUEST_CHANGES>",
+                       "reproduction scenario", "bypasses or weakens", "breaks existing tests",
+                       "concurrent runs or timing races"):
+            self.assertIn(phrase, text)
 
 
 class LockTests(unittest.TestCase):
@@ -306,8 +349,12 @@ class GitFlowTestCase(unittest.TestCase):
                  or c["trailers"].get("Harness-Result")) for c in self.branch_commits()]
 
     def agent(self, verdicts=("APPROVE",), crash_review=False):
-        """A fake agent: implement writes result.txt, review answers from the verdict list."""
+        """A fake agent: implement writes result.txt, review answers from the verdict list.
+
+        A verdict is APPROVE, REQUEST_CHANGES (mapped to BLOCKING 0 / 1) or a full review text."""
         reviews = iter(verdicts)
+        canned = {"APPROVE": "Fix the thing.\nBLOCKING: 0\nVERDICT: APPROVE\n",
+                  "REQUEST_CHANGES": "Fix the thing.\nBLOCKING: 1\nVERDICT: REQUEST_CHANGES\n"}
 
         def run(agent, phase, prompt, cwd, log, timeout):
             self.calls.append((agent, phase, prompt))
@@ -319,7 +366,8 @@ class GitFlowTestCase(unittest.TestCase):
                 return final
             if crash_review:
                 raise ValueError("agent crashed")
-            log.write_text(f"Fix the thing.\nVERDICT: {next(reviews)}\n", encoding="utf-8")
+            review = next(reviews)
+            log.write_text(canned.get(review, review), encoding="utf-8")
         return run
 
 
@@ -410,6 +458,29 @@ class RunTests(GitFlowTestCase):
         self.assertIn("Harness-Command: python -c", commits[4]["message"])
         # The next implement round sees the review findings from the review commit.
         self.assertIn("Previous review findings\nFix the thing.", self.calls[2][2])
+        self.assertIn(orchestrator.IMPLEMENT_SCOPE, self.calls[2][2])
+        self.assertNotIn(orchestrator.IMPLEMENT_SCOPE, self.calls[0][2])
+        self.assertEqual(["1", "0"], [commits[1]["trailers"]["Harness-Blocking"],
+                                      commits[3]["trailers"]["Harness-Blocking"]])
+        self.assertIn(orchestrator.REVIEW_INSTRUCTIONS, self.calls[1][2])
+        self.assertNotIn("후속 과제", (self.gh_state / "body.md").read_text(encoding="utf-8"))
+
+    def test_approved_review_with_follow_ups_reaches_the_pr_body(self):
+        self.merge_spec()
+        review = ("## Blocking\nNone\n\n## Follow-ups\n- 경계 상황을 더 막자.\n\nBLOCKING: 0\nVERDICT: APPROVE\n")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent((review,))):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "pass")], self.steps())
+        body = (self.gh_state / "body.md").read_text(encoding="utf-8")
+        self.assertIn("## 후속 과제 (리뷰)\n\n- 경계 상황을 더 막자.", body)
+
+    def test_missing_blocking_line_records_question_mark(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent(("VERDICT: APPROVE\n",))):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+        review = self.branch_commits()[1]
+        self.assertEqual(("MISSING", "?"), (review["trailers"]["Harness-Verdict"],
+                                            review["trailers"]["Harness-Blocking"]))
         for commit in commits:
             self.assertEqual("harness", run_git(self.worktree, "log", "-1", "--format=%an", commit["sha"]))
         self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"),
