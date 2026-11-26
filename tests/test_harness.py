@@ -481,6 +481,23 @@ class ProposeTests(GitFlowTestCase):
         self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
+    def test_copy_staged_just_before_rename_stays(self):
+        # The user stages the spec after the first ls-files check but before the copy is moved aside;
+        # the cleanup must notice and put the copy back instead of leaving a staged add + deletion.
+        real_rename = Path.rename
+
+        def stage_then_rename(path, *args, **kwargs):
+            if Path(path) == self.spec_path:
+                run_git(self.root, "add", "docs/tasks/demo.md")
+            return real_rename(path, *args, **kwargs)
+
+        with patch.object(Path, "rename", stage_then_rename):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual("A  docs/tasks/demo.md", run_git(self.root, "status", "--porcelain"))
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
     def test_locked_local_copy_does_not_fail_successful_propose(self):
         # On Windows a file can be readable for hashing but locked against deletion.
         real_rename = Path.rename
@@ -557,6 +574,45 @@ class ProposeTests(GitFlowTestCase):
         self.assertEqual(1, len(leftovers))
         self.assertEqual(edited, leftovers[0].read_text(encoding="utf-8"))
         self.assertIn(str(leftovers[0]), self.stdout)
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_failed_restore_never_deletes_editor_replacement(self):
+        # The exclusive copy fails on close after an editor already replaced the destination; the
+        # editor's file must survive and both paths must be reported.
+        edited = SPEC + "\n추가 메모\n"
+        replacement = SPEC + "\n에디터가 바꿔 저장한 수정\n"
+        spec_path = self.spec_path
+        real_open = open
+
+        class ReplacedOnClose:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def write(self, data):
+                return self.handle.write(data)
+
+            def __exit__(self, *exc):
+                self.handle.close()
+                spec_path.write_text(replacement, encoding="utf-8")
+                raise OSError("close failed")
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            return ReplacedOnClose(handle) if mode == "xb" else handle
+
+        with self.edited_after_push(edited), \
+                patch.object(orchestrator.os, "link", side_effect=OSError("no hard links")), \
+                patch.object(orchestrator, "open", failing_open, create=True):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(replacement, self.spec_path.read_text(encoding="utf-8"))
+        leftovers = [p for p in self.spec_path.parent.iterdir() if p.name.endswith(".propose")]
+        self.assertEqual(1, len(leftovers))
+        self.assertEqual(edited, leftovers[0].read_text(encoding="utf-8"))
+        self.assertIn(str(leftovers[0]), self.stdout)
+        self.assertIn(str(self.spec_path), self.stdout)
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
     def test_local_copy_stays_when_index_cannot_be_read(self):

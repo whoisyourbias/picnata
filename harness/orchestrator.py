@@ -599,14 +599,7 @@ def remove_pushed_copy(main_root, task_path, blob):
     """Delete the untracked specification left in the main checkout once it matches the pushed blob,
     so a later git pull of the merged specification is not blocked by it."""
     target = main_root / task_path
-    if not target.is_file():
-        return False
-    try:
-        # Delete only when Git positively reports the path as untracked; an index it cannot read
-        # (or any other git failure) leaves the file alone.
-        if git(main_root, "ls-files", "--", task_path).strip():
-            return False
-    except (ValueError, OSError, subprocess.SubprocessError):
+    if not target.is_file() or not is_untracked(main_root, task_path):
         return False
     # Move the copy aside before hashing it, so the bytes that are verified are exactly the bytes
     # that get deleted. Anything an editor saves at the original path meanwhile is left untouched.
@@ -617,6 +610,11 @@ def remove_pushed_copy(main_root, task_path, blob):
         # The proposal already succeeded; a file locked against moving or deletion (common on
         # Windows) only means the local copy stays, so report it instead of failing propose.
         print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
+        return False
+    # The path may have been staged between the first check and the rename. Once the copy is moved
+    # aside, staging can no longer pick up these bytes, so this second check is final.
+    if not is_untracked(main_root, task_path):
+        restore_candidate(candidate, target)
         return False
     try:
         # Hash under the original path so the same attributes (eol, filters) apply as for the push.
@@ -639,6 +637,15 @@ def remove_pushed_copy(main_root, task_path, blob):
     return False
 
 
+def is_untracked(main_root, task_path):
+    """True only when Git positively reports the path as absent from the index; an index it cannot
+    read (or any other git failure) counts as tracked, so the file is left alone."""
+    try:
+        return not git(main_root, "ls-files", "--", task_path).strip()
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return False
+
+
 def restore_candidate(candidate, target):
     """Put a moved-aside copy back at target without overwriting a file saved there in the meantime."""
     try:
@@ -658,8 +665,8 @@ def restore_candidate(candidate, target):
 
 
 def copy_exclusive(candidate, target):
-    """Copy candidate to a newly created target; never replaces an existing target. On any failure
-    the candidate stays at its temporary path and that path is reported."""
+    """Copy candidate to a newly created target; never replaces or deletes an existing target. On any
+    failure the candidate stays at its temporary path and that path is reported."""
     try:
         data = candidate.read_bytes()
         handle = open(target, "xb")
@@ -673,12 +680,10 @@ def copy_exclusive(candidate, target):
         with handle:
             handle.write(data)
     except OSError as exc:
-        # Only our own partial file can be at target here; remove it so it is not mistaken for the copy.
-        try:
-            target.unlink()
-        except OSError:
-            pass
-        print(f"로컬 사본을 되돌리지 못해 {candidate}에 남겨 둡니다: {exc}")
+        # Exclusive creation proved ownership only when the file was opened; an editor may have
+        # replaced target since. Never delete target here: leave both files and name both paths.
+        print(f"로컬 사본을 되돌리지 못했습니다: {exc}. {target}는 불완전하거나 새로 저장된 파일일 수 "
+              f"있어 그대로 두고, 이전 사본은 {candidate}에 남겨 둡니다.")
         return False
     return True
 
