@@ -193,6 +193,16 @@ class ParseVerdictTests(unittest.TestCase):
         # A fence in an earlier section does not hide the Follow-ups heading.
         self.assertEqual("- a", follow("## Blocking\n```\n# x\n```\n## Follow-ups\n- a\nBLOCKING: 0\nVERDICT: APPROVE"))
 
+    def test_review_follow_ups_keeps_issue_references(self):
+        follow = orchestrator.review_follow_ups
+        self.assertEqual("#123 tracks the documentation update.",
+                         follow("## Blocking\nNone\n\n## Follow-ups\n#123 tracks the documentation update.\n\n"
+                                "BLOCKING: 0\nVERDICT: APPROVE"))
+        self.assertEqual("- a\n#45 is related.\n- b",
+                         follow("## Follow-ups\n- a\n#45 is related.\n- b\n## Next\n- c"))
+        # Closing hashes on a heading are still stripped.
+        self.assertEqual("- a", follow("## Follow-ups ##\n- a\nBLOCKING: 0\nVERDICT: APPROVE"))
+
 class PromptTests(unittest.TestCase):
     def test_review_prompt_states_severity_and_format(self):
         text = orchestrator.REVIEW_INSTRUCTIONS

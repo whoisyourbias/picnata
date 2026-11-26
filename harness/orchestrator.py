@@ -108,13 +108,14 @@ def review_follow_ups(text):
             if level is not None:
                 collected.append(line.rstrip())
             continue
-        heading = re.fullmatch(r"(#+)\s*(.*?)\s*#*", stripped) if stripped.startswith("#") else None
+        # ATX headings need whitespace (or nothing) after the hashes; '#123' is an issue reference.
+        heading = re.fullmatch(r"(#{1,6})(?:\s+(.*?))?(?:\s+#+)?\s*", stripped)
         if heading:
             depth = len(heading.group(1))
             if level is not None and depth <= level:
                 break
             if level is None:
-                if heading.group(2).lower() == "follow-ups":
+                if (heading.group(2) or "").lower() == "follow-ups":
                     level = depth
                 continue
         if level is not None:
