@@ -225,3 +225,42 @@ class WorkflowTests(unittest.TestCase):
             row = db.execute("SELECT review_verdict, review_notes FROM tasks").fetchone()
         self.assertTrue({"review_verdict", "review_notes"} <= columns)
         self.assertEqual((None, None), row)
+
+    def run_agent_script(self, verdicts):
+        calls, answers = [], iter(verdicts)
+
+        def agent(name, phase, prompt, cwd, log, timeout):
+            calls.append((name, phase))
+            if phase == "implement":
+                (cwd / "result.txt").write_text(f"v{len(calls)}", encoding="utf-8")
+            else:
+                log.write_text(f"Finding.\n{next(answers)}\n", encoding="utf-8")
+        return calls, agent
+
+    def test_run_reworks_until_review_approves_then_verifies(self):
+        calls, agent = self.run_agent_script(["VERDICT: REQUEST_CHANGES", "VERDICT: APPROVE"])
+        with patch.object(orchestrator, "run_agent", side_effect=agent):
+            code = self.cli("run", "demo", "task.md", "codex", "--", sys.executable, "-c", "pass")
+        self.assertEqual(0, code)
+        self.assertEqual([("codex", "implement"), ("claude", "review")] * 2, calls)
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            self.assertEqual("verified", db.execute("SELECT phase FROM tasks").fetchone()[0])
+        with patch.object(orchestrator, "run_agent") as agent_again:
+            self.assertEqual(0, self.cli("run", "demo", "task.md", "codex", "--", sys.executable, "-c", "pass"))
+        agent_again.assert_not_called()
+
+    def test_run_stops_for_human_after_max_rounds(self):
+        calls, agent = self.run_agent_script(["VERDICT: REQUEST_CHANGES"] * 2)
+        with patch.object(orchestrator, "run_agent", side_effect=agent):
+            code = self.cli("--timeout", "60", "run", "demo", "task.md", "codex", "--max-rounds", "2",
+                            "--", sys.executable, "-c", "pass")
+        self.assertEqual(1, code)
+        self.assertEqual(2, [phase for _, phase in calls].count("implement"))
+        with closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            self.assertEqual(("reviewed", "REQUEST_CHANGES"),
+                             tuple(db.execute("SELECT phase, review_verdict FROM tasks").fetchone()))
+
+    def test_run_requires_verification_command(self):
+        with self.assertRaises(SystemExit):
+            self.cli("run", "demo", "task.md", "codex")
+

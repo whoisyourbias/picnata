@@ -264,6 +264,18 @@ python -m harness.orchestrator verify add-tests -- python -m unittest discover -
 python -m harness.orchestrator status add-tests
 ```
 
+단계를 한 번에 돌리려면 `run`을 쓴다. 작업이 없으면 `assign`부터 시작하고, 리뷰가 `REQUEST_CHANGES`면
+리뷰 의견을 넣어 다시 구현·리뷰하며, `APPROVE`가 되면 `verify`까지 실행한다.
+`--`로 검증 명령을 구분하며, 중간에 멈췄거나 실패했다면 같은 명령을 다시 실행해 이어서 진행한다.
+
+```powershell
+python -m harness.orchestrator run add-tests path/to/task.md codex --max-rounds 3 -- python -m unittest discover -s tests
+```
+
+- `--max-rounds`(기본 3)는 구현 실행 횟수 상한이다. 상한까지 반려되면 멈추고 사람에게 넘긴다.
+- 검증 명령이 실패하면 재구현하지 않고 멈춘다. 원인을 확인한 뒤 같은 명령을 다시 실행한다.
+- 병합은 항상 사람이 결정한다.
+
 - `assign`은 현재 HEAD를 기준으로 `harness/<작업 ID>` 브랜치와 전용 worktree를 만들고
   명세 내용을 SQLite에 저장한다. 마지막 인자에 `claude` 또는 `codex`를 지정한다.
 - `implement`는 배정된 에이전트를 실행한다. 실행이 끝나면 작업 worktree에 남은 변경을

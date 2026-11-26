@@ -243,32 +243,93 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=900, help="Step timeout in seconds.")
     subparsers = parser.add_subparsers(dest="action", required=True)
-    for action in ("assign", "status", "implement", "review", "verify"):
+    for action in ("assign", "status", "implement", "review", "verify", "run"):
         subparsers.add_parser(action).add_argument("id")
-    assignment = subparsers.choices["assign"]
-    assignment.add_argument("spec", type=Path)
-    assignment.add_argument("agent", choices=OTHER_AGENT)
-    subparsers.choices["verify"].add_argument("command", nargs=argparse.REMAINDER)
+    for name in ("assign", "run"):
+        subparsers.choices[name].add_argument("spec", type=Path)
+        subparsers.choices[name].add_argument("agent", choices=OTHER_AGENT)
+    subparsers.choices["run"].add_argument("--max-rounds", type=int, default=3,
+                                           help="Maximum implement runs before asking a human.")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command = []
+    if "--" in argv:
+        split = argv.index("--")
+        argv, command = argv[:split], argv[split + 1:]
     args = parser.parse_args(argv)
+    args.command = command
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", args.id):
         parser.error("Use a task ID of 1–64 lowercase letters, digits and hyphens, starting with a letter.")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be a positive number of seconds.")
-    if args.action == "verify":
-        if args.command[:1] == ["--"]:
-            args.command = args.command[1:]
-        if not args.command:
-            parser.error("verify requires a command after the task ID.")
+    if args.action == "run" and args.max_rounds < 1:
+        parser.error("--max-rounds must be at least 1.")
+    if args.action in ("verify", "run") and not args.command:
+        parser.error(f"{args.action} requires a verification command after '--'.")
     return args
+
+
+def locate(cwd):
+    root = Path(git(cwd or Path.cwd(), "rev-parse", "--show-toplevel")).resolve()
+    common = (root / git(root, "rev-parse", "--git-common-dir")).resolve()
+    state = (common.parent / ".harness") if common.name == ".git" else (root / ".harness")
+    state.mkdir(exist_ok=True)
+    return root, state
+
+
+def read_task(state, task_id):
+    with closing(sqlite3.connect(state / "tasks.sqlite3", timeout=30)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute(SCHEMA)
+        migrate(db)
+        db.commit()
+        return db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+def run_task(args, cwd):
+    """Drive assign -> implement -> review (-> rework) -> verify; stop for a human when stuck."""
+    _, state = locate(cwd)
+
+    def step(*extra):
+        return main(["--timeout", str(args.timeout), *extra], cwd=cwd)
+
+    if read_task(state, args.id) is None:
+        if code := step("assign", args.id, str(args.spec), args.agent):
+            return code
+    implements = 0
+    while True:
+        task = read_task(state, args.id)
+        phase, verdict = task["phase"], task["review_verdict"]
+        if phase == "verified":
+            print(f"{args.id}: verified; merge is a human decision.")
+            return 0
+        if phase.startswith("running:"):
+            print(f"{args.id}: already {phase}.", file=sys.stderr)
+            return 1
+        if phase == "assigned" or (phase == "reviewed" and verdict != "APPROVE"):
+            if implements >= args.max_rounds:
+                print(f"{args.id}: reviewer still requests changes after {implements} implement run(s). "
+                      f"Read the review log ({task['last_log']}), then run again.", file=sys.stderr)
+                return 1
+            implements += 1
+            if code := step("implement", args.id):
+                return code
+        elif phase == "implemented":
+            if code := step("review", args.id):
+                return code
+        else:
+            return step("verify", args.id, "--", *args.command)
 
 
 def main(argv=None, cwd=None):
     args = parse_args(argv)
+    if args.action == "run":
+        try:
+            return run_task(args, cwd)
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
     try:
-        root = Path(git(cwd or Path.cwd(), "rev-parse", "--show-toplevel")).resolve()
-        common = (root / git(root, "rev-parse", "--git-common-dir")).resolve()
-        state = (common.parent / ".harness") if common.name == ".git" else (root / ".harness")
-        state.mkdir(exist_ok=True)
+        root, state = locate(cwd)
         worktree = state / "worktrees" / args.id
         with closing(sqlite3.connect(state / "tasks.sqlite3", timeout=30)) as db:
             db.row_factory = sqlite3.Row

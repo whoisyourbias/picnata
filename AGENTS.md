@@ -5,3 +5,4 @@
 - 각 작업은 배정된 worktree에서 진행한다. 다른 작업의 worktree를 수정하지 않는다.
 - 변경을 검증하고 실행한 명령과 결과를 인수인계한다.
 - 구현과 교차 리뷰 절차는 [협업 운영안](docs/agent-collaboration.md)을 따른다.
+- 하네스(`python -m harness.orchestrator run ...`)가 배정한 작업은 그 worktree에서만 수행하고, 직접 `git commit`하지 않는다. 구현 요청은 명세를 작성해 `run`으로 진행할 수 있다.
