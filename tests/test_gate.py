@@ -73,6 +73,15 @@ class GateTests(unittest.TestCase):
         run_git(self.root, *IDENT, "commit", "-m", "spec")
         self.assertEqual([], self.check("spec/demo", base))
 
+    def test_spec_branch_fails_when_base_already_has_the_spec(self):
+        self.write("docs/tasks/demo.md", "# approved\n")
+        run_git(self.root, *IDENT, "commit", "-m", "approved spec")
+        base = self.sha()
+        run_git(self.root, "checkout", "-q", "-b", "spec/demo")
+        self.write("docs/tasks/demo.md", "# changed\n")
+        run_git(self.root, *IDENT, "commit", "-m", "spec again")
+        self.assertTrue(self.check("spec/demo", base))
+
     def test_spec_branch_with_other_files_fails(self):
         base = self.sha()
         run_git(self.root, "checkout", "-q", "-b", "spec/demo")

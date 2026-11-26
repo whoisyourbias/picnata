@@ -22,6 +22,8 @@ TASK_ID = r"[a-z][a-z0-9-]{0,63}"
 
 def check_spec_branch(cwd, base, head, task_id):
     path = f"docs/tasks/{task_id}.md"
+    if git_ok(cwd, "cat-file", "-e", f"{base}:{path}"):
+        return [f"{path}가 base에 이미 있습니다. 이미 승인된 명세입니다."]
     changes = git(cwd, "diff", "--name-status", "--no-renames", f"{base}...{head}").splitlines()
     if changes != [f"A\t{path}"]:
         return [f"spec/{task_id} 브랜치는 {path} 추가 하나만 포함해야 합니다 (변경: {', '.join(changes) or '없음'})."]

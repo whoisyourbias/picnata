@@ -130,6 +130,17 @@ class SpecParsingTests(unittest.TestCase):
             orchestrator.verify_command("# T\n\n## 목표\nx\n")
 
 
+class ParseVerdictTests(unittest.TestCase):
+    def test_last_line_decides(self):
+        parse = orchestrator.parse_verdict
+        self.assertEqual("APPROVE", parse("좋습니다.\nVERDICT: APPROVE"))
+        self.assertEqual("APPROVE", parse("좋습니다.\n  VERDICT: APPROVE  \n\n\n"))
+        self.assertEqual("REQUEST_CHANGES", parse("문제\nVERDICT: REQUEST_CHANGES\n"))
+        self.assertEqual("MISSING", parse("VERDICT: APPROVE\n그러나 버그가 있습니다."))
+        self.assertEqual("MISSING", parse("VERDICT: APPROVE please"))
+        self.assertEqual("MISSING", parse(""))
+
+
 class LockTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -576,6 +587,38 @@ class RunTests(GitFlowTestCase):
                 patch.object(orchestrator, "push_branch", real_push):
             self.assertEqual(0, self.run_cli(), self.stderr)
         self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+
+    def complete_run_then_rewind_local(self):
+        """Origin ends at review; the local branch is stale at implement (as in a second clone)."""
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        review = run_git(self.worktree, "rev-parse", "HEAD~1")
+        implement = run_git(self.worktree, "rev-parse", "HEAD~2")
+        run_git(self.origin, "update-ref", "refs/heads/harness/demo", review)
+        run_git(self.worktree, "reset", "--hard", implement)
+        run_git(self.root, "update-ref", "-d", "refs/remotes/origin/harness/demo")
+        self.calls.clear()
+        return implement, review
+
+    def test_stale_local_branch_fast_forwards_and_skips_review(self):
+        _, review = self.complete_run_then_rewind_local()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent:
+            self.assertEqual(0, self.run_cli(), self.stderr)
+            agent.assert_not_called()
+        self.assertEqual([("implement", None), ("review", "APPROVE"), ("verify", "pass")], self.steps())
+        self.assertEqual(review, run_git(self.worktree, "rev-parse", "HEAD~1"))
+        self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
+
+    def test_diverged_local_and_remote_exits_1_without_agent(self):
+        self.complete_run_then_rewind_local()
+        (self.worktree / "local.txt").write_text("local", encoding="utf-8")
+        run_git(self.worktree, "add", "local.txt")
+        run_git(self.worktree, *IDENT, "commit", "-m", "local only")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()) as agent:
+            self.assertEqual(1, self.run_cli())
+            agent.assert_not_called()
+        self.assertIn("로컬 harness/demo와 origin/harness/demo가 갈라졌습니다", self.stderr)
 
     def test_tree_changed_during_verify_is_not_recorded_as_pass(self):
         self.merge_spec()

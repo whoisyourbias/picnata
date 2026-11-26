@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,50 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn("머지", message)
         self.assertEqual(0, self.run_hook({"tool_name": "Bash", "tool_input": {"command": "ls"}})[0])
+
+    def test_label_bypass_is_denied(self):
+        for command in ("gh pr edit 3 --add-label harness-maintenance",
+                        "gh label create harness-maintenance",
+                        "gh pr create --label harness-maintenance",
+                        "gh api repos/o/r/issues/3 -f labels[]=harness-maintenance"):
+            with self.subTest(command):
+                self.assertIsNotNone(guard.decide_bash(command, {}))
+        self.assertIsNone(guard.decide_bash("gh pr view 3", {}))
+
+
+@unittest.skipUnless(shutil.which("sh"), "sh가 필요합니다")
+class HookCommandTests(unittest.TestCase):
+    ALLOW_ALL = "import sys\nsys.exit(0)\n"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        run_git(self.root, "init")
+        run_git(self.root, "commit", "--allow-empty", "-m", "init")
+        self.worktree = self.root / ".harness" / "worktrees" / "demo"
+        run_git(self.root, "worktree", "add", "-b", "harness/demo", str(self.worktree))
+        settings = json.loads((Path(guard.__file__).parents[1] / ".claude" / "settings.json").read_text("utf-8"))
+        self.command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        (self.worktree / "harness").mkdir()
+        (self.worktree / "harness" / "guard.py").write_text(self.ALLOW_ALL, encoding="utf-8")
+
+    def hook(self, project_dir):
+        event = {"tool_name": "Write", "cwd": str(project_dir),
+                 "tool_input": {"file_path": str(self.root / "main.py")}}
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project_dir)}
+        env.pop("HARNESS_GUARD", None)
+        return subprocess.run(["sh", "-c", self.command], input=json.dumps(event), env=env,
+                              capture_output=True, encoding="utf-8").returncode
+
+    def test_worktree_guard_copy_is_ignored(self):
+        (self.root / "harness").mkdir()
+        shutil.copy(guard.__file__, self.root / "harness" / "guard.py")
+        self.assertEqual(2, self.hook(self.worktree))
+
+    def test_missing_main_guard_denies(self):
+        self.assertEqual(2, self.hook(self.worktree))
+        self.assertEqual(2, self.hook(self.root / "nowhere"))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,6 @@ OTHER_AGENT = {"claude": "codex", "codex": "claude"}
 NOTES_LIMIT = 8000
 TRUNCATED = "…(잘림)"
 WAIT_INTERVAL = 30
-VERDICT_LINE = re.compile(r"\s*VERDICT:(.*)", re.IGNORECASE)
 TRAILER_LINE = re.compile(r"(Harness-[A-Za-z]+):[ \t]*(.*)")
 AUTHOR = ["-c", "user.name=harness", "-c", "user.email=harness@example.invalid", "-c", "commit.gpgsign=false"]
 STEP_ORDER = ("implement", "review", "verify")
@@ -33,19 +32,11 @@ class NotApproved(ValueError):
 
 
 def parse_verdict(text):
-    """Return APPROVE only if the last VERDICT line is exactly that; otherwise REQUEST_CHANGES."""
-    last = None
-    for line in text.splitlines():
-        if match := VERDICT_LINE.fullmatch(line.rstrip()):
-            last = match.group(1).strip()
-    return "APPROVE" if last == "APPROVE" else "REQUEST_CHANGES"
-
-
-def review_verdict(text):
-    """APPROVE, REQUEST_CHANGES, or MISSING when the reviewer wrote no VERDICT line at all."""
-    if not any(VERDICT_LINE.fullmatch(line.rstrip()) for line in text.splitlines()):
-        return "MISSING"
-    return parse_verdict(text)
+    """APPROVE or REQUEST_CHANGES only when the last non-empty line is exactly that verdict; else MISSING."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and lines[-1] in ("VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES"):
+        return lines[-1].split(": ", 1)[1]
+    return "MISSING"
 
 
 def git(cwd, *args, input=None, env=None, timeout=60):
@@ -626,6 +617,25 @@ def pending_push(worktree, task_id):
     return not git_ok(worktree, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}")
 
 
+def sync_remote(worktree, task_id):
+    """Bring harness/<id> level with origin before planning: fast-forward a stale local branch,
+    leave unpushed local commits to pending_push, and refuse a diverged history."""
+    branch = f"harness/{task_id}"
+    if not git(worktree, "ls-remote", "--heads", "origin", branch, timeout=300):
+        return
+    git(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=300)
+    remote = f"origin/{branch}"
+    if git(worktree, "rev-parse", "HEAD") == git(worktree, "rev-parse", remote):
+        return
+    if git_ok(worktree, "merge-base", "--is-ancestor", remote, "HEAD"):
+        return
+    if git_ok(worktree, "merge-base", "--is-ancestor", "HEAD", remote):
+        ensure_clean(worktree)
+        git(worktree, "merge", "--ff-only", remote)
+        return
+    raise ValueError(f"로컬 {branch}와 {remote}가 갈라졌습니다. 직접 정리한 뒤 다시 run 하세요.")
+
+
 def trees_equal(worktree, first, second):
     return git(worktree, "rev-parse", f"{first}^{{tree}}") == git(worktree, "rev-parse", f"{second}^{{tree}}")
 
@@ -682,7 +692,7 @@ class Task:
         if git(self.worktree, "rev-parse", "HEAD") != commit:
             raise ValueError("리뷰하는 동안 작업 커밋이 바뀌었습니다.")
         output = final_message(final, log)
-        verdict = review_verdict(output)
+        verdict = parse_verdict(output)
         message = build_message(
             f"harness({self.id}): review {verdict}", output,
             [("Harness-Task", self.id), ("Harness-Step", "review"), ("Harness-Agent", reviewer),
@@ -765,6 +775,7 @@ def run_task(args, cwd):
         if (error := lock_busy_error(state / "locks" / f"{args.id}.json", args.id)) is not None:
             raise error
         ensure_clean(worktree)
+        sync_remote(worktree, args.id)
         commits = read_commits(worktree, merged_task=args.id)
         step, round_number, last = plan_next(commits)
         if step == "done":
@@ -780,6 +791,7 @@ def run_task(args, cwd):
         with step_lock(state, args.id, step):
             try:
                 # Publish a stage commit left behind by an earlier push failure before doing more work.
+                sync_remote(worktree, args.id)
                 if pending_push(worktree, args.id):
                     push_branch(worktree, args.id)
                 # The plan above was made without the lock; decide again now that we own it.

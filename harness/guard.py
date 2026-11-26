@@ -7,6 +7,9 @@
 - Files outside this repository: allowed.
 - Bash: no merging or approving pull requests and no touching the lock files.
 
+The hook command (.claude/settings.json) always runs the main checkout's copy of this file, found
+through git's common dir, so editing a worktree copy changes nothing; if it is not found, the hook fails closed.
+
 Set HARNESS_GUARD=off in the shell that launches the agent to maintain the harness itself.
 The agent cannot change that variable for the hook process.
 """
@@ -21,6 +24,8 @@ from pathlib import Path, PurePosixPath
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 GH_MERGE = re.compile(r"\bgh\b[^|;&\n]*\bpr\s+merge\b")
 GH_APPROVE = re.compile(r"\bgh\b[^|;&\n]*\bpr\s+review\b[^|;&\n]*(?:--approve\b|\s-a\b)")
+GH_LABEL_BYPASS = re.compile(
+    r"\bgh\b[^|;&\n]*\b(?:pr\s+(?:edit|create)|label|api)\b[^|;&\n]*harness-maintenance")
 LOCKS = re.compile(r"\.harness[/\\]+locks")
 
 
@@ -115,6 +120,8 @@ def decide_bash(command, env=os.environ):
         return "PR 머지는 사람만 할 수 있습니다. 사용자에게 GitHub에서 머지해 달라고 요청하세요."
     if GH_APPROVE.search(command):
         return "PR 승인은 사람만 할 수 있습니다."
+    if GH_LABEL_BYPASS.search(command):
+        return "harness-maintenance 라벨은 사람만 부여할 수 있습니다."
     if LOCKS.search(command):
         return "하네스 잠금 파일(.harness/locks)은 하네스만 수정할 수 있습니다. 상태는 `orchestrator status <작업 ID>`로 확인하세요."
     return None
