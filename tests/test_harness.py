@@ -86,6 +86,65 @@ class AgentLaunchTests(unittest.TestCase):
                 self.assertEqual("1", os.environ["CODEX_WINDOWS_REGISTERED_CORE"])
 
 
+BASH_RULES = [
+    "Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)",
+    "Bash(gradle:*)", "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
+    "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)", "Bash(./backend/gradlew:*)",
+]
+POWERSHELL_ONLY = [r".\gradlew.bat", r".\backend\gradlew.bat", r"backend\gradlew.bat"]
+
+
+class AgentPermissionTests(unittest.TestCase):
+    def command(self, agent, phase):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.dict(os.environ, {"CODEX_WINDOWS_REGISTERED_CORE": ""}),
+                patch.object(orchestrator.shutil, "which", side_effect=lambda name: name),
+                patch.object(orchestrator, "run_logged") as run,
+            ):
+                orchestrator.run_agent(agent, phase, "Go", root, root / f"{phase}.log", 60)
+            command = run.call_args.args[0]
+            # Normalise the temporary output path so commands compare across calls.
+            return [part.replace(str(root), "<tmp>") for part in command]
+
+    @staticmethod
+    def rules(command):
+        return command[command.index("--allowedTools") + 1].split(",")
+
+    def test_claude_implement_allows_bash_and_powershell_rules(self):
+        rules = self.rules(self.command("claude", "implement"))
+        powershell = [rule.replace("Bash(", "PowerShell(", 1) for rule in BASH_RULES]
+        powershell += [f"PowerShell({prefix}:*)" for prefix in POWERSHELL_ONLY]
+        self.assertEqual(9, len(BASH_RULES))
+        self.assertEqual(12, len(powershell))
+        for rule in BASH_RULES + powershell:
+            self.assertIn(rule, rules)
+        self.assertEqual(21, len(rules))
+
+    def test_bash_and_powershell_rules_share_one_prefix_list(self):
+        rules = orchestrator.CLAUDE_IMPLEMENT_ALLOWED_TOOLS
+        prefix = re.compile(r"^(Bash|PowerShell)\((.*):\*\)$")
+        parsed = [prefix.match(rule).groups() for rule in rules]
+        bash = {p for tool, p in parsed if tool == "Bash"}
+        powershell = {p for tool, p in parsed if tool == "PowerShell"}
+        self.assertEqual(set(POWERSHELL_ONLY), powershell - bash)
+        self.assertEqual(bash, powershell - set(POWERSHELL_ONLY))
+        self.assertEqual(set(orchestrator.IMPLEMENT_COMMAND_PREFIXES), bash)
+
+    def test_other_commands_are_unchanged(self):
+        self.assertEqual(["claude", "-p", "--permission-mode", "plan"], self.command("claude", "review"))
+        self.assertEqual(["claude", "-p", "--permission-mode", "default",
+                          "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"],
+                         self.command("claude", "spec"))
+        self.assertEqual(["codex", "-a", "never", "exec", "-s", "workspace-write",
+                          "-o", str(Path("<tmp>") / "implement-final.md"), "-"],
+                         self.command("codex", "implement"))
+        self.assertEqual(["codex", "-a", "never", "exec", "-s", "read-only",
+                          "-o", str(Path("<tmp>") / "review-final.md"), "-"],
+                         self.command("codex", "review"))
+
+
 class ClaudeFinalResponseTests(unittest.TestCase):
     def test_claude_stdout_is_captured_apart_from_stderr(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -292,10 +351,10 @@ class GitFlowTestCase(unittest.TestCase):
         run_git(self.root, "push", "origin", "main")
 
     def cli(self, *args):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
             code = orchestrator.main(list(args), cwd=self.root)
-        self.stderr = stderr.getvalue()
+        self.stderr, self.stdout = stderr.getvalue(), stdout.getvalue()
         return code
 
     def branch_commits(self):
@@ -337,14 +396,18 @@ class ProposeTests(GitFlowTestCase):
         self.assertEqual(1, self.cli("propose", "demo"))
 
     def test_propose_pushes_one_file_on_top_of_origin_main(self):
-        before = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "status", "--porcelain"),
-                  run_git(self.root, "ls-files"), run_git(self.root, "symbolic-ref", "HEAD"),
-                  self.spec_path.read_text(encoding="utf-8"))
+        before = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "ls-files"),
+                  run_git(self.root, "symbolic-ref", "HEAD"))
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
-        after = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "status", "--porcelain"),
-                 run_git(self.root, "ls-files"), run_git(self.root, "symbolic-ref", "HEAD"),
-                 self.spec_path.read_text(encoding="utf-8"))
+        after = (run_git(self.root, "rev-parse", "HEAD"), run_git(self.root, "ls-files"),
+                 run_git(self.root, "symbolic-ref", "HEAD"))
         self.assertEqual(before, after)
+        # The untracked local copy matched the pushed blob, so it is gone and the checkout is clean.
+        self.assertFalse(self.spec_path.exists())
+        self.assertEqual("", run_git(self.root, "status", "--porcelain"))
+        self.assertIn("로컬 사본을 지웠습니다. 수정하려면: git show origin/spec/demo:docs/tasks/demo.md "
+                      "> docs/tasks/demo.md", self.stdout)
+        self.assertEqual(SPEC, run_git(self.root, "show", "origin/spec/demo:docs/tasks/demo.md") + "\n")
         main = run_git(self.origin, "rev-parse", "main")
         self.assertEqual(main, run_git(self.origin, "rev-parse", "spec/demo^"))
         self.assertEqual("docs/tasks/demo.md", run_git(self.origin, "diff", "--name-only", main, "spec/demo"))
@@ -356,9 +419,39 @@ class ProposeTests(GitFlowTestCase):
 
     def test_existing_pr_is_not_duplicated(self):
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.set_spec(SPEC)
         self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
         calls = (self.gh_state / "calls.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(1, len(calls))
+
+    def test_local_copy_stays_when_pr_creation_fails(self):
+        with patch.object(orchestrator, "gh_available", return_value=None):
+            self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+
+    def test_local_copy_stays_when_push_fails(self):
+        run_git(self.root, "remote", "set-url", "--push", "origin", str(self.root.parent / "missing.git"))
+        self.assertEqual(1, self.cli("propose", "demo"))
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+
+    def test_local_copy_stays_when_content_differs(self):
+        real_open_pr = orchestrator.open_pr
+
+        def edit_then_open(*args, **kwargs):
+            self.spec_path.write_text(SPEC + "\n추가 메모\n", encoding="utf-8")
+            return real_open_pr(*args, **kwargs)
+
+        with patch.object(orchestrator, "open_pr", side_effect=edit_then_open):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertTrue(self.spec_path.exists())
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
+    def test_tracked_local_copy_stays(self):
+        # Tracked locally (for example staged) but not on origin/main yet.
+        run_git(self.root, "add", "docs/tasks/demo.md")
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(SPEC, self.spec_path.read_text(encoding="utf-8"))
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
     def test_already_approved_spec_is_rejected(self):
         self.merge_spec()
@@ -382,6 +475,18 @@ class RunTests(GitFlowTestCase):
             agent.assert_not_called()
         self.assertIn("명세 PR(spec/demo)이 아직 머지되지 않았습니다.", self.stderr)
         self.assertFalse(self.worktree.exists())
+
+    def test_implement_prompt_lists_allowed_command_prefixes(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.cli("run", "demo", "claude"), self.stderr)
+        prompt = next(prompt for _, phase, prompt in self.calls if phase == "implement")
+        for prefix in orchestrator.IMPLEMENT_COMMAND_PREFIXES + POWERSHELL_ONLY:
+            self.assertIn(f"`{prefix}`", prompt)
+        self.assertIn("single command", prompt)
+        for example in ("python -m unittest discover -s tests", "backend/gradlew.bat -p backend test"):
+            self.assertIn(example, prompt)
+        self.assertIn("If you could not run the tests", prompt)
 
     def test_wait_times_out_with_3(self):
         with patch.object(orchestrator, "WAIT_INTERVAL", 0.05):

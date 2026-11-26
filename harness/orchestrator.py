@@ -90,11 +90,27 @@ def run_logged(command, cwd, log, timeout, prompt=None, env=None, stdout_path=No
 
 
 READ_ONLY_PHASES = {"review", "spec"}
-CLAUDE_IMPLEMENT_ALLOWED_TOOLS = [
-    "Bash(python -m unittest:*)", "Bash(python3 -m unittest:*)",
-    "Bash(gradle:*)", "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)",
-    "Bash(backend/gradlew:*)", "Bash(backend/gradlew.bat:*)", "Bash(./backend/gradlew:*)",
+# Test and build command prefixes the implementer may run without approval. Bash and PowerShell rules
+# are both generated from these lists so the two tools never drift apart.
+IMPLEMENT_COMMAND_PREFIXES = [
+    "python -m unittest", "python3 -m unittest",
+    "gradle", "./gradlew", "gradlew", "gradlew.bat",
+    "backend/gradlew", "backend/gradlew.bat", "./backend/gradlew",
 ]
+POWERSHELL_ONLY_PREFIXES = [r".\gradlew.bat", r".\backend\gradlew.bat", r"backend\gradlew.bat"]
+CLAUDE_IMPLEMENT_ALLOWED_TOOLS = (
+    [f"Bash({prefix}:*)" for prefix in IMPLEMENT_COMMAND_PREFIXES]
+    + [f"PowerShell({prefix}:*)" for prefix in IMPLEMENT_COMMAND_PREFIXES + POWERSHELL_ONLY_PREFIXES]
+)
+IMPLEMENT_COMMAND_GUIDE = (
+    "Run tests and builds from the worktree root as a single command that starts with one of these "
+    "allowed prefixes: "
+    + ", ".join(f"`{prefix}`" for prefix in IMPLEMENT_COMMAND_PREFIXES + POWERSHELL_ONLY_PREFIXES)
+    + ". Anything else needs approval and is refused: do not use `cd`, `&&`, `;`, `|`, redirection, "
+    "or run temporary scripts. Examples: `python -m unittest discover -s tests`, "
+    "`python -m unittest tests.test_gate`, `backend/gradlew.bat -p backend test`. "
+    "If you could not run the tests, say so and why in your final response."
+)
 
 
 def run_agent(agent, phase, prompt, cwd, log, timeout):
@@ -568,8 +584,22 @@ def propose(args, cwd):
     print(f"{args.id}: pushed {branch} ({commit[:12]})")
     goals = spec_sections(spec, "목표", "가정")
     open_pr(main_root, branch, f"spec: {title}", goals + "\n")
+    if remove_pushed_copy(main_root, task_path, blob):
+        print(f"로컬 사본을 지웠습니다. 수정하려면: git show origin/{branch}:{task_path} > {task_path}")
     print("명세 PR을 머지하면 승인입니다. 머지한 뒤 run을 실행하세요.")
     return 0
+
+
+def remove_pushed_copy(main_root, task_path, blob):
+    """Delete the untracked specification left in the main checkout once it matches the pushed blob,
+    so a later git pull of the merged specification is not blocked by it."""
+    target = main_root / task_path
+    if not target.is_file() or git_ok(main_root, "ls-files", "--error-unmatch", "--", task_path):
+        return False
+    if git(main_root, "hash-object", "--", str(target)) != blob:
+        return False
+    target.unlink()
+    return True
 
 
 # ---- run ---------------------------------------------------------------------------------------
@@ -683,6 +713,7 @@ class Task:
             "Implement the task in this worktree. Read the applicable project instructions. "
             "Stay on the assigned branch and keep changes local. The harness commits your changes; "
             "do not run git commit. Report the changes and checks.\n\n"
+            f"{IMPLEMENT_COMMAND_GUIDE}\n\n"
             f"Task specification\n{self.spec}"
         )
         if last and last["trailers"].get("Harness-Step") == "review":
