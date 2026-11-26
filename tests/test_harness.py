@@ -1348,16 +1348,6 @@ class AdoptTests(GitFlowTestCase):
         self.assertEqual(101, len(lines))
         self.assertEqual([f"Test {subject}" for subject in subjects], [line.split(" ", 1)[1] for line in lines])
 
-    def test_status_shows_earlier_adoption_while_another_human_commit_is_pending(self):
-        self.after_implement()
-        human = self.human_commit()
-        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
-            self.assertEqual(0, self.run_cli("codex", "--adopt"), self.stderr)
-        self.human_commit("later.txt", "later", "later fix")
-        text = self.status_text()
-        self.assertIn(f"adopted: {human}..{human} (round 2)", text)
-        self.assertIn("next step: blocked", text)
-
     def test_adopt_without_human_commits_changes_nothing(self):
         self.merge_spec()
         with patch.object(orchestrator, "run_agent", side_effect=self.agent(("REQUEST_CHANGES", "APPROVE"))):

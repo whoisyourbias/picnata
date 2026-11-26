@@ -1139,14 +1139,7 @@ def status(args, cwd):
     print(f"task: {args.id}\nspec approved (origin/main): {'yes' if approved else 'no'}")
     if local or remote:
         commits = read_commits(main_root, branch if local else f"origin/{branch}", merged_task=args.id)
-        try:
-            step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
-        except ValueError:
-            # Trailerless commits after the last harness commit: report the branch instead of failing,
-            # so earlier adoptions and the rest of the status still show.
-            step = "blocked (트레일러 없는 커밋; 정리하거나 run --adopt로 이어받으세요)"
-            round_number = max((int(c["trailers"].get("Harness-Round", 0) or 0) for c in commits
-                                if c["trailers"].get("Harness-Step") == "implement"), default=1)
+        step, round_number, last = plan_next(commits) if commits else ("implement", 1, None)
         verdict = next((c["trailers"].get("Harness-Verdict") for c in commits
                         if c["trailers"].get("Harness-Step") == "review"), None)
         pushed = remote and (not local or git_ok(main_root, "merge-base", "--is-ancestor", branch, f"origin/{branch}"))
