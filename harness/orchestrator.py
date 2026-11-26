@@ -619,7 +619,8 @@ def remove_pushed_copy(main_root, task_path, blob):
         print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
         return False
     try:
-        matches = git(main_root, "hash-object", "--", str(candidate)) == blob
+        # Hash under the original path so the same attributes (eol, filters) apply as for the push.
+        matches = git(main_root, "hash-object", f"--path={task_path}", "--", str(candidate)) == blob
     except (ValueError, OSError, subprocess.SubprocessError):
         matches = False
     if matches:
@@ -646,19 +647,40 @@ def restore_candidate(candidate, target):
         print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
         return
     except OSError:
-        # No hard links on this file system; fall back to a rename guarded by an existence check.
-        try:
-            if target.exists():
-                print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
-            else:
-                candidate.rename(target)
-        except OSError as exc:
-            print(f"로컬 사본을 {candidate}에서 되돌리지 못했습니다: {exc}")
-        return
+        # No hard links on this file system. A rename could overwrite a file saved meanwhile, so
+        # copy the bytes into a file created exclusively ("x" fails if target exists) instead.
+        if not copy_exclusive(candidate, target):
+            return
     try:
         candidate.unlink()
     except OSError as exc:
         print(f"임시 사본 {candidate}를 지우지 못했습니다: {exc}")
+
+
+def copy_exclusive(candidate, target):
+    """Copy candidate to a newly created target; never replaces an existing target. On any failure
+    the candidate stays at its temporary path and that path is reported."""
+    try:
+        data = candidate.read_bytes()
+        handle = open(target, "xb")
+    except FileExistsError:
+        print(f"{target}에 새 파일이 생겨 이전 사본을 {candidate}에 남겨 둡니다.")
+        return False
+    except OSError as exc:
+        print(f"로컬 사본을 되돌리지 못해 {candidate}에 남겨 둡니다: {exc}")
+        return False
+    try:
+        with handle:
+            handle.write(data)
+    except OSError as exc:
+        # Only our own partial file can be at target here; remove it so it is not mistaken for the copy.
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        print(f"로컬 사본을 되돌리지 못해 {candidate}에 남겨 둡니다: {exc}")
+        return False
+    return True
 
 
 # ---- run ---------------------------------------------------------------------------------------

@@ -512,6 +512,53 @@ class ProposeTests(GitFlowTestCase):
         self.assertIn("로컬 사본을 지우지 못해 남겨 둡니다", self.stdout)
         self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
 
+    def test_crlf_copy_normalized_by_path_attributes_is_removed(self):
+        # The pushed blob is LF-normalized by a *.md attribute; the cleanup must hash the moved-aside
+        # copy under the original path, or the unchanged CRLF copy would stay and block git pull.
+        run_git(self.root, "config", "core.autocrlf", "false")
+        (self.root / ".git" / "info").mkdir(exist_ok=True)
+        (self.root / ".git" / "info" / "attributes").write_text("*.md text eol=lf\n", encoding="utf-8")
+        self.spec_path.write_bytes(SPEC.replace("\n", "\r\n").encode("utf-8"))
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertFalse(self.spec_path.exists())
+        self.assertEqual([], list(self.spec_path.parent.iterdir()))
+        self.assertIn("로컬 사본을 지웠습니다", self.stdout)
+        self.assertEqual(SPEC, run_git(self.root, "show", "origin/spec/demo:docs/tasks/demo.md") + "\n")
+
+    def edited_after_push(self, text):
+        real_open_pr = orchestrator.open_pr
+
+        def edit_then_open(*args, **kwargs):
+            self.spec_path.write_text(text, encoding="utf-8")
+            return real_open_pr(*args, **kwargs)
+        return patch.object(orchestrator, "open_pr", side_effect=edit_then_open)
+
+    def test_restore_without_hard_links_copies_back(self):
+        edited = SPEC + "\n추가 메모\n"
+        with self.edited_after_push(edited), \
+                patch.object(orchestrator.os, "link", side_effect=OSError("no hard links")):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(edited, self.spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(["demo.md"], sorted(p.name for p in self.spec_path.parent.iterdir()))
+
+    def test_restore_without_hard_links_never_overwrites_concurrent_save(self):
+        edited = SPEC + "\n추가 메모\n"
+        replacement = SPEC + "\n복원 중에 저장한 수정\n"
+
+        def save_then_fail(*args, **kwargs):
+            # An editor saves a new file after the hard link failed, before the fallback restores.
+            self.spec_path.write_text(replacement, encoding="utf-8")
+            raise OSError("no hard links")
+
+        with self.edited_after_push(edited), patch.object(orchestrator.os, "link", side_effect=save_then_fail):
+            self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertEqual(replacement, self.spec_path.read_text(encoding="utf-8"))
+        leftovers = [p for p in self.spec_path.parent.iterdir() if p.name.endswith(".propose")]
+        self.assertEqual(1, len(leftovers))
+        self.assertEqual(edited, leftovers[0].read_text(encoding="utf-8"))
+        self.assertIn(str(leftovers[0]), self.stdout)
+        self.assertNotIn("로컬 사본을 지웠습니다", self.stdout)
+
     def test_local_copy_stays_when_index_cannot_be_read(self):
         # A tracked copy must not be deleted just because git ls-files fails on a corrupt index.
         run_git(self.root, "add", "docs/tasks/demo.md")
