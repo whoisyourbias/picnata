@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -90,6 +90,18 @@ def clean_commit(worktree, base):
     return commit
 
 
+@contextmanager
+def write_transaction(db):
+    """Short write transaction; never hold it while an agent or verify command runs."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        db.rollback()
+        raise
+    db.commit()
+
+
 def assign(db, root, worktree, args):
     if db.execute("SELECT 1 FROM tasks WHERE id = ?", (args.id,)).fetchone():
         raise ValueError(f"Task already assigned: {args.id}")
@@ -105,24 +117,34 @@ def assign(db, root, worktree, args):
 
 def advance(db, task, worktree, state, args):
     action = args.action
-    phase = task["phase"]
     allowed = {
         "implement": {"assigned", "implemented", "reviewed", "verified"},
         "review": {"implemented", "reviewed", "verified"},
         "verify": {"reviewed", "verified"},
     }
-    if phase not in allowed[action]:
-        raise ValueError(f"Cannot {action} a task in phase {phase}.")
-    if (Path(git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree
-            or git(worktree, "symbolic-ref", "--short", "HEAD") != f"harness/{task['id']}"):
-        raise ValueError("Expected the assigned worktree and task branch.")
+    with write_transaction(db):
+        task = db.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+        phase = task["phase"]
+        if phase.startswith("running:"):
+            raise ValueError(
+                f"Task {task['id']} is already running ({phase.split(':', 1)[1]}). If that process died, "
+                f"reset it manually: UPDATE tasks SET phase='assigned' WHERE id='{task['id']}' "
+                "(or 'implemented'/'reviewed' to resume from that step) in .harness/tasks.sqlite3."
+            )
+        if phase not in allowed[action]:
+            raise ValueError(f"Cannot {action} a task in phase {phase}.")
+        if (Path(git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree
+                or git(worktree, "symbolic-ref", "--short", "HEAD") != f"harness/{task['id']}"):
+            raise ValueError("Expected the assigned worktree and task branch.")
+        db.execute("UPDATE tasks SET phase=? WHERE id=?", (f"running:{action}", task["id"]))
 
     log = state / "logs" / task["id"] / f"{action}-{uuid4().hex}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.touch()
     reviewed = task["reviewed_commit"]
     failure_phase = {"implement": "assigned", "review": "implemented", "verify": "reviewed"}
-    error = None
+    phase = failure_phase[action]
+    error = "Interrupted"
     try:
         if action == "implement":
             reviewed = None
@@ -156,16 +178,17 @@ def advance(db, task, worktree, state, args):
             if clean_commit(worktree, task["base"]) != reviewed:
                 raise ValueError("The task commit changed during verification.")
             phase = "verified"
+        error = None
     except (OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
-        phase = failure_phase[action]
         error = str(exc) or "Interrupted"
         with log.open("ab") as output:
             output.write(f"\n{error}\n".encode("utf-8"))
-
-    db.execute(
-        "UPDATE tasks SET phase=?, reviewed_commit=?, last_log=?, last_error=? WHERE id=?",
-        (phase, reviewed, str(log), error, task["id"]),
-    )
+    finally:
+        with write_transaction(db):
+            db.execute(
+                "UPDATE tasks SET phase=?, reviewed_commit=?, last_log=?, last_error=? WHERE id=?",
+                (phase, reviewed, str(log), error, task["id"]),
+            )
     print(f"{task['id']}: {phase}; log: {log}")
     if error:
         print(error, file=sys.stderr)
@@ -203,13 +226,13 @@ def main(argv=None, cwd=None):
         state = (common.parent / ".harness") if common.name == ".git" else (root / ".harness")
         state.mkdir(exist_ok=True)
         worktree = state / "worktrees" / args.id
-        with closing(sqlite3.connect(state / "tasks.sqlite3")) as db, db:
+        with closing(sqlite3.connect(state / "tasks.sqlite3", timeout=30)) as db:
             db.row_factory = sqlite3.Row
             db.execute(SCHEMA)
-            if args.action != "status":
-                db.execute("BEGIN IMMEDIATE")
+            db.commit()
             if args.action == "assign":
-                assign(db, root, worktree, args)
+                with write_transaction(db):
+                    assign(db, root, worktree, args)
                 return 0
             task = db.execute("SELECT * FROM tasks WHERE id = ?", (args.id,)).fetchone()
             if task is None:
