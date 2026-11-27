@@ -67,7 +67,7 @@ class Claimed(ValueError):
 ISSUE_TASK = re.compile(r"issue-([1-9][0-9]*)")
 LOCK_RETRIES = 3
 LOCK_RETRY_DELAY = 2
-CONFLICT_OPEN = re.compile(r"^(<{7}|>{7})(?: |$)", re.MULTILINE)
+CONFLICT_OPEN = re.compile(r"^(<{7}|={7}|>{7})(?: |$)", re.MULTILINE)
 COMMENT_HEADER = "하네스 명세 초안의 열린 질문입니다. 답을 이 이슈에 남기거나 세션에서 알려 주세요."
 
 BLOCKING_LINE = re.compile(r"BLOCKING: (\d+)")
@@ -457,18 +457,21 @@ def plan_next(commits):
 
 
 def conflict_files(commits):
-    """Files of the newest conflicted sync that no review or verify has followed yet, else [].
+    """Files of conflicted syncs that no review or verify has followed yet, else [].
 
-    commits is newest first; implement commits after the sync are conflict-resolution attempts."""
+    commits is newest first; implement commits and clean syncs between are skipped, so a clean
+    sync cannot hide an earlier conflict that is still unresolved."""
+    files = []
     for commit in commits:
         trailers = commit["trailers"]
         step = trailers.get("Harness-Step")
-        if step == "implement":
+        if step == "implement" or (step == "sync" and not trailers.get("Harness-Conflict")):
             continue
-        if step == "sync" and trailers.get("Harness-Conflict"):
-            return [name for name in trailers["Harness-Conflict"].split(",") if name]
-        return []
-    return []
+        if step == "sync":
+            files += [name for name in trailers["Harness-Conflict"].split(",") if name and name not in files]
+            continue
+        break
+    return files
 
 
 def files_with_markers(worktree, files):
@@ -1124,7 +1127,7 @@ class Task:
         # Run in a throwaway detached checkout so the harness branch and its worktree stay untouched.
         scratch = self.state / "verify" / f"{self.id}-{uuid4().hex}"
         scratch.parent.mkdir(parents=True, exist_ok=True)
-        git(self.worktree, "worktree", "add", "--detach", "-q", str(scratch), head)
+        git_retry(self.worktree, "worktree", "add", "--detach", "-q", str(scratch), head)
         try:
             run_logged(self.command, scratch, log, self.args.timeout)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -1219,9 +1222,9 @@ def run_task(args, cwd):
                         commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
                 conflicts = conflict_files(commits)
-                if (step == "review" and conflicts and last["trailers"].get("Harness-Step") == "implement"
-                        and files_with_markers(worktree, conflicts)):
-                    # A resolution round that left markers behind is not reviewed; resolve again.
+                if step == "review" and conflicts and files_with_markers(worktree, conflicts):
+                    # Unresolved markers (left by a resolution round, or hidden under a later clean
+                    # sync) are never reviewed; resolve again.
                     step, round_number = "implement", round_number + 1
                 if step == "done":
                     print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
@@ -1295,9 +1298,7 @@ def status(args, cwd):
         print(f"branch: {branch}\npushed: {'yes' if pushed else 'no'}")
         ref = branch if local else f"origin/{branch}"
         behind = int(git(main_root, "rev-list", "--count", f"{ref}..origin/main") or 0) if behind_main(main_root, ref) else 0
-        merged = git_ok(main_root, "merge-base", "--is-ancestor", ref, "origin/main") \
-            and any("Harness-Step" in c["trailers"] for c in commits)
-        if behind and not merged:
+        if behind:
             print(f"behind main: {behind} commits")
     else:
         print(f"next step: implement\nround: 1\nlast verdict: -\nbranch: - (아직 run 하지 않음)\npushed: no")
