@@ -60,6 +60,16 @@ class NotApproved(ValueError):
     """The specification pull request has not been merged into main."""
 
 
+class Claimed(ValueError):
+    """Another session already took this task."""
+
+
+ISSUE_TASK = re.compile(r"issue-([1-9][0-9]*)")
+LOCK_RETRIES = 3
+LOCK_RETRY_DELAY = 2
+CONFLICT_OPEN = re.compile(r"^(<{7}|>{7})(?: |$)", re.MULTILINE)
+COMMENT_HEADER = "하네스 명세 초안의 열린 질문입니다. 답을 이 이슈에 남기거나 세션에서 알려 주세요."
+
 BLOCKING_LINE = re.compile(r"BLOCKING: (\d+)")
 VERDICT_MISMATCH = "경고: 리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 수를 따릅니다"
 
@@ -145,6 +155,23 @@ def git(cwd, *args, input=None, env=None, timeout=60):
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise ValueError(message or f"git {args[0]} failed")
     return result.stdout.decode("utf-8", errors="replace").rstrip("\n")
+
+
+def is_lock_contention(message):
+    """True when git failed because another process holds a lock on the shared repository."""
+    return (any(text in message for text in ("index.lock", "cannot lock ref", ".lock': File exists"))
+            or ("Unable to create" in message and ".lock" in message))
+
+
+def git_retry(cwd, *args, **kwargs):
+    """git, retried (LOCK_RETRIES attempts) only when another session holds a repository lock."""
+    for attempt in range(LOCK_RETRIES):
+        try:
+            return git(cwd, *args, **kwargs)
+        except ValueError as exc:
+            if attempt == LOCK_RETRIES - 1 or not is_lock_contention(str(exc)):
+                raise
+            time.sleep(LOCK_RETRY_DELAY)
 
 
 def git_ok(cwd, *args):
@@ -423,7 +450,78 @@ def plan_next(commits):
         return "implement", current + 1, last
     if step == "verify":
         return ("done" if trailers.get("Harness-Result") == "pass" else "verify"), current, last
+    if step == "sync":
+        # A sync that left conflict markers is resolved by a new implement round; a clean one is reviewed.
+        return ("implement", current + 1, last) if trailers.get("Harness-Conflict") else ("review", current, last)
     raise ValueError(f"알 수 없는 Harness-Step: {step}")
+
+
+def conflict_files(commits):
+    """Files of the newest conflicted sync that no review or verify has followed yet, else [].
+
+    commits is newest first; implement commits after the sync are conflict-resolution attempts."""
+    for commit in commits:
+        trailers = commit["trailers"]
+        step = trailers.get("Harness-Step")
+        if step == "implement":
+            continue
+        if step == "sync" and trailers.get("Harness-Conflict"):
+            return [name for name in trailers["Harness-Conflict"].split(",") if name]
+        return []
+    return []
+
+
+def files_with_markers(worktree, files):
+    """The files among the given paths that still hold conflict markers."""
+    found = []
+    for name in files:
+        path = Path(worktree) / name
+        try:
+            if path.is_file() and CONFLICT_OPEN.search(path.read_text(encoding="utf-8", errors="replace")):
+                found.append(name)
+        except OSError:
+            continue
+    return found
+
+
+def behind_main(worktree, ref="HEAD"):
+    return not git_ok(worktree, "merge-base", "--is-ancestor", "origin/main", ref)
+
+
+def sync_main(worktree, task_id):
+    """Merge origin/main into the task branch when it has fallen behind, and push the merge.
+
+    Without own commits the branch just fast-forwards. A conflict is committed with its markers and
+    named in Harness-Conflict, so the next implement round resolves it."""
+    if not behind_main(worktree):
+        return
+    own = read_commits(worktree)
+    if not own:
+        ensure_clean(worktree)
+        git(worktree, "merge", "--ff-only", "origin/main")
+        print(f"{task_id}: fast-forwarded to origin/main")
+        return
+    if "Harness-Step" not in own[0]["trailers"]:
+        return  # Commits without trailers are on top: plan_next reports them (or --adopt takes them).
+    ensure_clean(worktree)
+    merged = git(worktree, "rev-parse", "origin/main")
+    try:
+        git(worktree, *AUTHOR, "merge", "--no-commit", "--no-ff", "origin/main")
+        conflicts = []
+    except ValueError as exc:
+        conflicts = git(worktree, "-c", "core.quotepath=false", "diff", "--name-only", "--diff-filter=U").splitlines()
+        if not conflicts:
+            git_ok(worktree, "merge", "--abort")
+            raise ValueError(f"main 병합에 실패했습니다: {exc}") from exc
+    git(worktree, "add", "-A")
+    trailers = [("Harness-Task", task_id), ("Harness-Step", "sync"), ("Harness-Merged", merged)]
+    body = f"main {merged[:12]}까지 병합했습니다."
+    if conflicts:
+        trailers.append(("Harness-Conflict", ",".join(conflicts)))
+        body += f"\n충돌 파일: {', '.join(conflicts)}"
+    harness_commit(worktree, build_message(f"harness({task_id}): sync with main", body, trailers))
+    print(f"{task_id}: merged origin/main {merged[:12]}" + (f"; 충돌: {', '.join(conflicts)}" if conflicts else ""))
+    push_branch(worktree, task_id)
 
 
 def ensure_clean(worktree):
@@ -648,7 +746,7 @@ def locate(cwd):
 
 
 def fetch(root):
-    git(root, "fetch", "origin", timeout=300)
+    git_retry(root, "fetch", "origin", timeout=300)
 
 
 # ---- propose -----------------------------------------------------------------------------------
@@ -672,6 +770,12 @@ def propose(args, cwd):
         raise ValueError(f"origin/main에 {task_path}가 이미 있습니다 (이미 승인됨).")
     title = spec_title(spec, args.id)
     branch = f"spec/{args.id}"
+    claimed = (f"{branch}가 이미 있습니다. 다른 세션이 집은 작업이면 건드리지 마세요. "
+               "내가 올린 명세를 고치는 것이면 --update로 다시 실행하세요.")
+    remote_head = git(main_root, "ls-remote", "--heads", "origin", branch, timeout=300).split()
+    remote_sha = remote_head[0] if remote_head else None
+    if remote_sha and not args.update:
+        raise Claimed(claimed)
     with tempfile.TemporaryDirectory() as scratch:
         env = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}
         blob = git(main_root, "hash-object", "-w", "--", str(target))
@@ -680,10 +784,22 @@ def propose(args, cwd):
         tree = git(main_root, "write-tree", env=env)
     message = build_message(f"spec({args.id}): {title}", "", [("Harness-Task", args.id)])
     commit = git(main_root, *AUTHOR, "commit-tree", tree, "-p", "origin/main", "-F", "-", input=message)
-    git(main_root, "push", "--force", "origin", f"{commit}:refs/heads/{branch}", timeout=300)
+    # A new branch is pushed without force, so of two sessions pushing at once git rejects one of them.
+    push = ["push", "origin", f"{commit}:refs/heads/{branch}"]
+    if remote_sha:
+        push.insert(1, f"--force-with-lease=refs/heads/{branch}:{remote_sha}")
+    try:
+        git(main_root, *push, timeout=300)
+    except ValueError as exc:
+        if any(text in str(exc) for text in ("rejected", "stale info", "already exists", "non-fast-forward")):
+            raise Claimed(claimed) from exc
+        raise
     print(f"{args.id}: pushed {branch} ({commit[:12]})")
     goals = spec_sections(spec, "목표", "가정")
-    open_pr(main_root, branch, f"spec: {title}", goals + "\n")
+    body = goals + "\n"
+    if issue := ISSUE_TASK.fullmatch(args.id):
+        body += f"\nRefs #{issue.group(1)}\n"
+    open_pr(main_root, branch, f"spec: {title}", body)
     if remove_pushed_copy(main_root, task_path, blob):
         print(f"로컬 사본을 지웠습니다. 수정하려면: git show origin/{branch}:{task_path} > {task_path}")
         print(f"Windows PowerShell에서는 인코딩이 바뀌지 않게: "
@@ -809,16 +925,16 @@ def ensure_worktree(main_root, state, task_id):
             raise ValueError(f"{worktree}가 {branch} 브랜치가 아닙니다.")
         return worktree
     if git_ok(main_root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
-        git(main_root, "worktree", "add", str(worktree), branch)
+        git_retry(main_root, "worktree", "add", str(worktree), branch)
         return worktree
     # A clone may track only main, so fetch the task branch by name before choosing the start point:
     # starting a branch that already exists on origin from origin/main would fork its history.
     if git(main_root, "ls-remote", "--heads", "origin", branch, timeout=300):
-        git(main_root, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=300)
+        git_retry(main_root, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=300)
     if git_ok(main_root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
-        git(main_root, "worktree", "add", "-b", branch, str(worktree), f"origin/{branch}")
+        git_retry(main_root, "worktree", "add", "-b", branch, str(worktree), f"origin/{branch}")
     else:
-        git(main_root, "worktree", "add", "--no-track", "-b", branch, str(worktree), "origin/main")
+        git_retry(main_root, "worktree", "add", "--no-track", "-b", branch, str(worktree), "origin/main")
     return worktree
 
 
@@ -861,7 +977,7 @@ def sync_remote(worktree, task_id):
     branch = f"harness/{task_id}"
     if not git(worktree, "ls-remote", "--heads", "origin", branch, timeout=300):
         return
-    git(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=300)
+    git_retry(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=300)
     remote = f"origin/{branch}"
     if git(worktree, "rev-parse", "HEAD") == git(worktree, "rev-parse", remote):
         return
@@ -945,7 +1061,7 @@ class Task:
         log.touch()
         return log
 
-    def implement(self, round_number, last, log):
+    def implement(self, round_number, last, log, conflicts=()):
         # The command guide describes Claude's tool permissions; Codex runs under its own sandbox.
         guide = f"{IMPLEMENT_COMMAND_GUIDE}\n\n" if self.agent == "claude" else ""
         prompt = (
@@ -958,6 +1074,13 @@ class Task:
         if last and last["trailers"].get("Harness-Step") == "review":
             if findings := message_body(last["message"]):
                 prompt += f"\n\nPrevious review findings\n{findings}\n\n{IMPLEMENT_SCOPE}"
+        if conflicts:
+            prompt += (
+                "\n\nMerge conflicts with main\nThe harness merged origin/main into this branch and committed "
+                "the result with conflict markers. Conflicted files:\n"
+                + "\n".join(f"- {name}" for name in conflicts)
+                + "\n\nRemove every conflict marker (`<<<<<<<`, `=======`, `>>>>>>>`) and preserve the intent "
+                "of both sides. Do not revert the changes that came from main.")
         final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
         git(self.worktree, "add", "-A")
         message = build_message(
@@ -1049,6 +1172,8 @@ class Task:
                          and c["trailers"].get("Harness-Verdict") == "APPROVE"), None)
         if approved and (follow_ups := review_follow_ups(message_body(approved["message"]))):
             lines += ["", "## 후속 과제 (리뷰)", "", follow_ups]
+        if issue := ISSUE_TASK.fullmatch(self.id):
+            lines += ["", f"Closes #{issue.group(1)}"]
         open_pr(self.worktree, f"harness/{self.id}", title, "\n".join(lines) + "\n")
         return 0
 
@@ -1087,7 +1212,17 @@ def run_task(args, cwd):
                     print(f"{args.id}: adopted {adopted} as implement round {adopted_round} {sha[:12]}")
                     push_branch(worktree, args.id)
                     commits = read_commits(worktree, merged_task=args.id)
+                if args.sync:
+                    head = git(worktree, "rev-parse", "HEAD")
+                    sync_main(worktree, args.id)
+                    if git(worktree, "rev-parse", "HEAD") != head:
+                        commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
+                conflicts = conflict_files(commits)
+                if (step == "review" and conflicts and last["trailers"].get("Harness-Step") == "implement"
+                        and files_with_markers(worktree, conflicts)):
+                    # A resolution round that left markers behind is not reviewed; resolve again.
+                    step, round_number = "implement", round_number + 1
                 if step == "done":
                     print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
                     return task.finish(commits)
@@ -1104,13 +1239,15 @@ def run_task(args, cwd):
                 log = task.new_log(step)
                 set_lock_step(lock, step)
                 if step == "implement":
-                    sha, result = task.implement(round_number, last, log), None
+                    sha, result = task.implement(round_number, last, log, conflicts), None
                 elif step == "review":
                     sha, result = task.review(log, last)
                 else:
                     sha, result = task.verify(commits, log)
                 print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
                 push_branch(worktree, args.id)
+                if step == "implement" and conflicts and (left := files_with_markers(worktree, conflicts)):
+                    raise ValueError(f"충돌 표시가 남아 있습니다: {', '.join(left)}")
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 if log is not None:
                     with log.open("ab") as output:
@@ -1156,6 +1293,12 @@ def status(args, cwd):
             if "Harness-Step" in commit["trailers"] and (adopted := commit["trailers"].get("Harness-Adopted")):
                 print(f"adopted: {adopted} (round {commit['trailers'].get('Harness-Round', '?')})")
         print(f"branch: {branch}\npushed: {'yes' if pushed else 'no'}")
+        ref = branch if local else f"origin/{branch}"
+        behind = int(git(main_root, "rev-list", "--count", f"{ref}..origin/main") or 0) if behind_main(main_root, ref) else 0
+        merged = git_ok(main_root, "merge-base", "--is-ancestor", ref, "origin/main") \
+            and any("Harness-Step" in c["trailers"] for c in commits)
+        if behind and not merged:
+            print(f"behind main: {behind} commits")
     else:
         print(f"next step: implement\nround: 1\nlast verdict: -\nbranch: - (아직 run 하지 않음)\npushed: no")
     pr = "-"
@@ -1177,12 +1320,18 @@ def status(args, cwd):
 def write_spec(args, cwd):
     """Have an agent turn a feature request into docs/tasks/<id>.md using harness/prompts/spec.md."""
     root, state = locate(cwd)
+    generate_spec(root, state, args, args.request)
+    return 0
+
+
+def generate_spec(root, state, args, request):
+    """Run the read-only spec agent for args.id and write docs/tasks/<id>.md under root; returns the spec."""
     task_path = f"docs/tasks/{args.id}.md"
     target = root / task_path
     if target.exists():
         raise ValueError(f"Task specification already exists: {task_path}")
     template = (Path(__file__).parent / "prompts" / "spec.md").read_text(encoding="utf-8")
-    prompt = template.replace("{task_path}", task_path).replace("{request}", args.request.strip())
+    prompt = template.replace("{task_path}", task_path).replace("{request}", request.strip())
 
     def snapshot():
         # Harness logs live under .harness/; it is gitignored in this repository but may not be elsewhere.
@@ -1215,10 +1364,55 @@ def write_spec(args, cwd):
           f"  python -m harness.orchestrator propose {args.id}\n"
           "사람이 명세 PR(spec/<작업 ID>)을 머지하면 승인입니다. 그 뒤:\n"
           f"  python -m harness.orchestrator run {args.id} <claude|codex>")
+    return spec
+
+
+def from_issue(args, cwd):
+    """Draft a specification from a GitHub issue and claim the task (the push in propose confirms it)."""
+    _, state = locate(cwd)
+    main_root = state.parent
+    number = args.number
+    args.id = task_id = f"issue-{number}"
+    executable = gh_available(main_root)
+    if executable is None:
+        raise ValueError(f"gh를 설치하고 gh auth login 하세요. 이슈 #{number}를 읽을 수 없습니다.")
+    try:
+        issue = json.loads(run_gh(executable, main_root, "issue", "view", str(number),
+                                  "--json", "title,body,state,labels"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"이슈 #{number}를 읽지 못했습니다: {exc}") from exc
+    if not isinstance(issue, dict) or str(issue.get("state", "")).upper() != "OPEN":
+        raise ValueError(f"이슈 #{number}가 닫혀 있습니다.")
+    task_path = f"docs/tasks/{task_id}.md"
+    if (main_root / task_path).exists():
+        raise Claimed(f"{task_path}가 이미 있습니다. 같은 PC의 다른 세션이 작성 중입니다.")
+    fetch(main_root)
+    for branch in (f"spec/{task_id}", f"harness/{task_id}"):
+        if git(main_root, "ls-remote", "--heads", "origin", branch, timeout=300):
+            raise Claimed(f"origin에 {branch}가 이미 있습니다. 다른 세션이 집은 작업입니다.")
+    if git_ok(main_root, "cat-file", "-e", f"origin/main:{task_path}"):
+        raise Claimed(f"origin/main에 {task_path}가 이미 있습니다. 이미 명세가 승인된 작업입니다.")
+    request = f"이슈 #{number}: {issue.get('title') or ''}\n\n{issue.get('body') or ''}"
+    spec = generate_spec(main_root, state, args, request)
+    questions = section_body(spec, "열린 질문")
+    if args.no_comment or questions is None or questions.strip().rstrip(".") == "없음":
+        return 0
+    comment = f"{COMMENT_HEADER}\n\n{questions}\n"
+    try:
+        run_gh(executable, main_root, "issue", "comment", str(number), "--body-file", "-", input=comment)
+    except ValueError as exc:
+        raise ValueError(f"명세는 {task_path}에 썼지만 이슈 코멘트를 남기지 못했습니다: {exc}") from exc
+    print(f"이슈 #{number}에 코멘트를 남겼습니다:\n{comment}")
     return 0
 
 
 # ---- CLI ---------------------------------------------------------------------------------------
+
+
+def issue_number(text):
+    if not re.fullmatch(r"[1-9][0-9]*", text):
+        raise argparse.ArgumentTypeError(f"issue number must be a positive integer, not {text!r}")
+    return int(text)
 
 
 def parse_args(argv):
@@ -1227,6 +1421,11 @@ def parse_args(argv):
     subparsers = parser.add_subparsers(dest="action", required=True)
     for action in ("spec", "propose", "run", "status"):
         subparsers.add_parser(action).add_argument("id")
+    from_issue_parser = subparsers.add_parser("from-issue")
+    from_issue_parser.add_argument("number", type=issue_number, help="Issue number to draft a specification from.")
+    from_issue_parser.add_argument("agent", choices=OTHER_AGENT)
+    from_issue_parser.add_argument("--no-comment", action="store_true",
+                                   help="Do not post the open questions as an issue comment.")
     subparsers.choices["spec"].add_argument("request", help="Feature request to turn into a task specification.")
     for name in ("spec", "run"):
         subparsers.choices[name].add_argument("agent", choices=OTHER_AGENT)
@@ -1234,10 +1433,16 @@ def parse_args(argv):
                                            help="Maximum implement runs before asking a human.")
     subparsers.choices["run"].add_argument("--wait", type=float, default=0, metavar="SECONDS",
                                            help="Wait this long for the specification PR to be merged.")
+    subparsers.choices["run"].add_argument("--no-sync", dest="sync", action="store_false",
+                                           help="Do not merge origin/main into a branch that fell behind.")
+    subparsers.choices["propose"].add_argument("--update", action="store_true",
+                                               help="Update the spec/<id> branch you already pushed.")
     subparsers.choices["run"].add_argument("--adopt", action="store_true",
                                            help="Record commits without trailers after the last harness commit "
                                                 "as a human implement round, then review and verify them.")
     args = parser.parse_args(argv)
+    if args.action == "from-issue":
+        args.id = f"issue-{args.number}"
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", args.id):
         parser.error("Use a task ID of 1–64 lowercase letters, digits and hyphens, starting with a letter.")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
@@ -1253,12 +1458,16 @@ def parse_args(argv):
 
 def main(argv=None, cwd=None):
     args = parse_args(sys.argv[1:] if argv is None else list(argv))
-    handler = {"run": run_task, "spec": write_spec, "propose": propose, "status": status}[args.action]
+    handler = {"run": run_task, "spec": write_spec, "propose": propose, "status": status,
+               "from-issue": from_issue}[args.action]
     try:
         return handler(args, cwd)
     except NotApproved as exc:
         print(exc, file=sys.stderr)
         return 3
+    except Claimed as exc:
+        print(exc, file=sys.stderr)
+        return 4
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(exc, file=sys.stderr)
         return 1
