@@ -275,27 +275,106 @@ python -m harness.orchestrator status add-tests
 채팅에서 직접 요청해도 AGENTS.md의 같은 규칙에 따라 에이전트가 명세를 먼저 쓴다.
 
 - `propose`는 main 체크아웃의 명세(커밋 안 된 파일 가능)를 읽는다. "열린 질문" 절이 정확히 `없음`이 아니면 거부한다.
-  main 체크아웃의 브랜치·인덱스·작업 트리는 바꾸지 않는다. 머지 전에 명세를 고쳤다면 다시 `propose`하면 `spec/<작업 ID>`가 갱신된다.
-  `gh`가 없거나 인증되지 않았으면 push까지 하고 수동 PR URL을 안내한다.
+  main 체크아웃의 브랜치·인덱스는 바꾸지 않는다. push와 PR 생성이 성공하고 main 체크아웃의 명세가 git에서 추적되지 않는 파일이며
+  내용이 push한 것과 같으면, 머지 뒤 `git pull`을 막지 않도록 그 로컬 사본을 지운다. 추적 중이거나 내용이 다르거나 push·PR 생성이 실패하면 남긴다. 비교 전에 파일을 같은 폴더의 임시 이름으로 옮겨 확인한 바이트만 지우므로, 그 사이 편집기가 원래 경로에 새로 저장한 파일은 지우지 않는다.
+  `git ls-files`가 실패하는 등 추적 여부를 git으로 확인하지 못해도 남긴다.
+  파일이 잠겨 지우지 못하면(Windows) 남겨 두었다고 출력하고, 이미 성공한 `propose`는 실패로 바꾸지 않는다.
+  머지 전에 명세를 고치려면 `git show origin/spec/<작업 ID>:docs/tasks/<작업 ID>.md > docs/tasks/<작업 ID>.md`로 되살려 고친 뒤 다시 `propose`하면 `spec/<작업 ID>`가 갱신된다.
+  Windows PowerShell 5.1의 `>`는 UTF-16으로 저장하므로, 그 환경에서는 `git restore --source=origin/spec/<작업 ID> --worktree -- docs/tasks/<작업 ID>.md`로 되살린다(인덱스는 바꾸지 않는다).
+  `gh`가 없거나 인증되지 않았으면 push까지 하고 수동 PR URL을 안내한다(로컬 사본은 남는다).
 - `run`은 `origin/main`에 명세가 있어야 시작한다. 없으면 종료 코드 3이며, `--wait SECONDS`를 주면 30초마다 확인하며 머지를 기다린다.
   명세 내용과 "검증 명령" 절의 명령(첫 코드 블록, 없으면 절 본문 첫 줄)은 `origin/main` 기준이다.
   `harness/<작업 ID>` 브랜치와 `.harness/worktrees/<작업 ID>` worktree를 `origin/main`에서 만들고, 이미 있으면 이어서 진행한다.
 - 단계는 브랜치에서 `origin/main` 이후 `Harness-Step` 트레일러가 있는 마지막 커밋으로 계산한다. 중간에 멈췄다면 같은 명령을 다시 실행한다.
   트레일러 없는 커밋이 끼어 있거나 worktree에 커밋 안 된 변경이 있으면 오류로 멈춘다.
+- 구현 에이전트가 쓸 수 없는 파일(예: `.claude/settings.json`)은 사람이 `harness/<작업 ID>` 브랜치에 직접 커밋한 뒤
+  `run <작업 ID> <claude|codex> --adopt`로 이어받는다. 잠금과 원격 동기화 뒤, 마지막 하네스 커밋(없으면 `origin/main`) 뒤의
+  트레일러 없는 커밋을 하네스 작성자의 빈 기록 커밋 하나로 새 implement 라운드에 편입한다.
+  ```
+  harness(<작업 ID>): adopt human commits
+
+  <이어받은 커밋마다 "<짧은 SHA> <작성자 이름> <제목>">
+
+  Harness-Task: <작업 ID>
+  Harness-Step: implement
+  Harness-Agent: human
+  Harness-Round: <이전 최대 round + 1, 하네스 커밋이 없으면 1>
+  Harness-Adopted: <이어받은 첫 커밋 SHA>..<이어받은 마지막 커밋 SHA>
+  ```
+  기록 커밋을 push한 뒤 review → verify → 구현 PR로 이어진다. 리뷰어는 `run`에 준 에이전트의 반대쪽이다.
+  기록 커밋은 트리를 바꾸지 않으므로 리뷰가 승인하고 verify가 검증하는 트리에 사람의 변경이 포함되며, CI 게이트는 바뀌지 않는다.
+  이어받기는 `--max-rounds`에 세지 않는다. 이어받을 커밋이 없으면 `--adopt`는 아무것도 하지 않는다.
+  다음 경우에는 기록 커밋을 만들지 않고 종료 코드 1로 멈춘다: 머지 커밋이 있다, 승인된 명세 `docs/tasks/<작업 ID>.md`를 수정한다,
+  트레일러 없는 커밋 사이에 하네스 커밋이 끼어 있다(연속 구간이 아니다), 되돌림 등으로 브랜치 트리가 `origin/main`과 같다(`이어받을 변경이 없습니다`).
+  사람 커밋끼리 서로 되돌려도 브랜치에 `origin/main` 대비 변경이 남아 있으면 이어받는다. 본문 목록은 8000자 제한 없이 커밋마다 한 줄을 모두 남긴다.
+  작성자는 검증하지 않으므로 사람이 PR에서 본문 목록의 작성자를 확인한다. `--adopt` 없이 트레일러 없는 커밋이 있으면 지금처럼 거부하고 `--adopt` 안내를 덧붙인다.
 - 모든 하네스 커밋의 작성자는 `harness <harness@example.invalid>`이다. implement는 에이전트의 최종 응답, review는 리뷰어 출력,
   verify는 검증 명령 출력의 마지막 100줄을 본문(최대 8000자)에 남긴다. 에이전트 원본 로그는 `.harness/logs/<작업 ID>/`(로컬)에만 있다.
   Claude 구현자는 `python -m unittest`와 Gradle(`gradle`, `gradlew`, `backend/gradlew` 및 `.bat` 형태) 명령만 실행할 수 있다(review·spec은 읽기 전용).
+  허용 규칙은 하나의 명령 접두어 목록(`IMPLEMENT_COMMAND_PREFIXES`)에서 Bash와 PowerShell 도구 양쪽으로 만들고, PowerShell에는
+  `.\gradlew.bat`, `.\backend\gradlew.bat`, `backend\gradlew.bat`를 더 허용한다. Claude implement 프롬프트는 이 접두어로 시작하는 단일 명령을
+  worktree 루트에서 실행하라고 안내한다. `cd`, `&&`, `;`, `|`, 리디렉션, 임시 스크립트는 승인이 필요해 거부되며,
+  테스트를 못 돌렸으면 최종 응답에 그 사실과 이유를 쓰게 한다.
+  프롬프트는 이 명령을 Bash 도구로 먼저 실행하고, 한 도구가 거부하면 다른 도구로 같은 명령을 다시 시도하라고 안내한다.
+  확인 결과(Windows 11, Windows PowerShell 5.1, `harness-windows-tools` implement round 3): 하네스가 띄운 세션에서
+  `.claude/settings*.json`에 허용 규칙이 없는데도 Bash의 `python -m unittest discover -s tests`(81개 통과)와 `backend/gradlew.bat --version`은
+  승인 없이 실행됐다. 따라서 `--allowedTools`는 세션에 전달된다. 같은 세션의 PowerShell 도구는 `python -m unittest discover -s tests`,
+  `backend/gradlew.bat --version`, `.\backend\gradlew.bat --version`을 모두 "contains multiple operations"로 거부했다.
+  단일 명령도 거부되므로 규칙이 적용되기 전에 Claude Code의 PowerShell 명령 분석 단계에서 막히는 것으로 보이며, 하네스 쪽 규칙으로는 풀 수 없다.
+  PowerShell 규칙은 이 분석이 고쳐지면 바로 쓰이도록 남겨 두고, 지금은 Bash 도구가 실제 실행 경로다.
+  이 안내는 Claude의 도구 권한에 관한 것이므로 Codex 구현자 프롬프트에는 넣지 않는다.
   Codex 샌드박스는 네트워크가 닫혀 있으므로 Gradle이 필요한 작업은 Claude를 구현자로 지정한다.
   검증 명령 첫 인자에 경로 구분자가 있는 상대 경로(예: `backend/gradlew.bat`)를 쓰면 작업 worktree 기준으로 실행 파일을 찾는다.
-- review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 출력 마지막 줄을
-  `VERDICT: APPROVE` 또는 `VERDICT: REQUEST_CHANGES`로 끝내야 하며, 응답의 마지막 비어 있지 않은 줄만 읽는다. 그 줄이 정확히 두 판정 중 하나가 아니면(본문 중간 인용 포함) `MISSING`으로 기록한다.
-  반려되면 이전 리뷰 커밋의 본문이 다음 implement 프롬프트에 들어간다.
+- review는 상대 에이전트에 명세와 `origin/main`부터 작업 HEAD까지의 diff를 전달한다. 리뷰어는 지적을 두 심각도로 나눈다.
+  - 차단(Blocking): 근거(파일 위치와 재현 시나리오)가 있고, 명세의 동작 명세·완료 조건 위반, 일반적인 사용 흐름의 잘못된 결과·데이터 손실·크래시,
+    가드·승인·게이트 같은 보안·권한 장치의 우회·약화, 테스트 실패·기존 테스트 파손 중 하나인 지적.
+  - 후속(Follow-up): 그 밖의 모든 지적(명세가 요구하지 않은 드문 경계 상황, 방어 코드, 리팩터링, 이름·문서·스타일, 범위 밖 개선). 확신이 없으면 후속이다.
+    재현하려면 작업자가 설정·로그·다른 세션의 파일을 일부러 조작해야 하거나 두 프로세스가 같은 순간에 같은 지점을 통과해야 하는 시나리오도,
+    명세의 "완료 조건"에 그 시나리오가 직접 적혀 있지 않은 한 후속이다. 꼭 막아야 하는 경쟁 조건은 완료 조건에 적는다.
+- 재작업 라운드(브랜치에 이전 review 커밋이 있을 때)에는 리뷰 입력 끝에 두 절이 더 붙는다.
+  - `Previous blocking findings`: 직전 review 커밋 본문의 `## Blocking` 절. 직전 리뷰가 APPROVE였거나 절이 없으면 `None`.
+  - `Changes since the previous review`: 직전 리뷰의 `Harness-Reviewed` 커밋부터 HEAD까지의 diff. 그 커밋이 현재 히스토리에 없으면
+    `Not available; review the full diff above.`
+  이때 차단은 직전 차단 지적이 아직 해결되지 않았거나, `Changes since the previous review`의 변경이 새로 만든 회귀·명세 위반이거나,
+  명세의 완료 조건이 충족되지 않은 경우로 좁혀진다. 그 밖의 지적(앞서 지적되지 않았고 증분 diff에도 없는 코드에서 새로 찾은 문제 포함)은 후속이다.
+  첫 리뷰 라운드는 지금처럼 전체 diff만 보고 이 제한이 없다. 이 규칙은 리뷰어 프롬프트 수준의 장치이며 하네스가 지적 위치를 검사하지는 않으므로,
+  재작업 라운드에서 후속으로 남은 정확성 문제는 사람이 구현 PR의 후속 과제 절에서 확인한다.
+- 리뷰 출력은 `## Blocking`과 `## Follow-ups` 두 절을 쓰고(해당 없으면 본문 `None`), 마지막 두 줄을 정확히 다음처럼 끝낸다.
+  ```
+  BLOCKING: <차단 지적 수>
+  VERDICT: <APPROVE|REQUEST_CHANGES>
+  ```
+  하네스는 끝의 빈 줄을 뺀 마지막 줄이 `VERDICT` 줄이고 바로 앞 줄이 `BLOCKING: <0 이상의 정수>`일 때만 판정을 낸다(사이에 빈 줄이 있어도 안 된다).
+  `VERDICT: APPROVE` 한 줄만 쓰거나 형식이 다르면 `MISSING`이다. 판정은 수로 정한다: 0이면 `APPROVE`, 1 이상이면 `REQUEST_CHANGES`.
+  `VERDICT` 줄이 수와 어긋나면 `리뷰 판정과 BLOCKING 수가 어긋나 BLOCKING 수를 따릅니다` 경고를 남기고 수를 따른다.
+  review 커밋에는 `Harness-Blocking: <n>`(`MISSING`이면 `?`) 트레일러가 붙는다.
+- 반려되면 이전 리뷰 커밋의 본문이 다음 implement 프롬프트에 들어가고, 구현자는 Blocking 항목만 고치며 후속 과제로 범위를 넓히지 않는다.
+- 후속 과제는 승인을 막지 않는다. 마지막 APPROVE 리뷰의 `## Follow-ups` 절(하위 제목과 코드 블록 포함, 코드 블록 안의 `#` 줄은 제목으로 보지 않는다)이 `None`이 아니면 구현 PR 본문 끝에
+  `## 후속 과제 (리뷰)` 절로 붙으므로, 사람이 PR에서 보고 별도 작업으로 다룰지 정한다.
 - verify는 마지막 APPROVE 리뷰가 본 커밋과 HEAD의 트리가 같을 때만 실행한다. 실패해도 `Harness-Result: fail` 커밋을 남기고 종료 코드 1로 멈춘다.
   원인을 해결한 뒤 `run`을 다시 실행하면 verify부터 이어진다.
 - 각 단계 뒤에 `git push origin harness/<작업 ID>`를 한다. 검증을 통과하면 구현 PR을 연다. 머지는 사람만 하며 하네스는 자동 머지를 켜지 않는다.
 - `--max-rounds`(기본 3)는 이번 실행의 implement 횟수 상한이다. 상한까지 반려되면 멈추고 사람에게 넘긴다. 실행 제한은 기본 900초이며
   `--timeout 1800`처럼 하위 명령 앞에 지정한다.
 - `status <작업 ID>`는 git에서 계산한 단계·round·마지막 판정, 브랜치와 push 여부, 구현 PR URL, worktree, 마지막 로컬 로그를 보여 준다.
+  이어받은 라운드가 있으면 `adopted: <첫 SHA>..<마지막 SHA> (round <n>)` 줄을 더한다. 마지막 하네스 커밋 뒤에 트레일러 없는 커밋이 있으면
+  오류로 멈추지 않고 다음 단계를 `blocked (...)`로 표시하며, 이전 이어받기 줄과 나머지 정보도 그대로 보여 준다.
+
+### 여러 세션의 병렬 작업
+
+한 PC에서 여러 Claude 세션이 이슈의 서로 다른 작업을 동시에 `이슈 → 명세 PR → 구현 PR`까지 처리할 수 있다. 어떤 이슈를 누가 집을지는 세션(사람)이 정한다. 하네스는 상주하지 않고 작업을 자동 분배하지 않는다. 의존 작업(머지 안 된 다른 작업을 전제하는 작업)은 그 작업이 머지된 뒤에 시작하고, 여러 PC·클론의 동시 작업은 범위 밖이다(락 파일은 한 PC의 같은 저장소 안에서만 서로 보인다).
+
+- `from-issue <번호> <claude|codex> [--no-comment]`: `gh issue view`로 이슈를 읽어 작업 ID `issue-<번호>`의 명세 초안을 `docs/tasks/issue-<번호>.md`에 쓴다(`spec`과 같은 읽기 전용 에이전트, 이슈 본문은 데이터로만 취급). 이슈가 없거나 닫혀 있으면 종료 코드 1이다.
+  쓰기 전에 선점을 검사한다. 로컬 `docs/tasks/issue-<번호>.md`가 있거나(같은 PC의 다른 세션), `origin`에 `spec/issue-<번호>`·`harness/issue-<번호>`가 있거나, `origin/main`에 그 명세가 있으면 아무것도 만들지 않고 이유를 출력한 뒤 종료 코드 4이다.
+  명세의 "열린 질문"이 `없음`이 아니면 이슈에 코멘트로 남긴다(`--no-comment`로 끈다). 이슈를 닫거나 라벨·담당자를 바꾸지 않는다.
+- `propose`가 확정 선점이다. 원격에 `spec/<작업 ID>`가 이미 있으면 push하지 않고 종료 코드 4로 거부한다. 내가 올린 명세를 고치는 것이면 `--update`로 `--force-with-lease` 갱신한다. 새 브랜치는 강제 push하지 않으므로 동시에 push하면 한쪽은 git이 거부하고 같은 안내(종료 코드 4)가 나온다.
+- 작업 ID가 `issue-<번호>`면 명세 PR 본문 끝에 `Refs #<번호>`, 구현 PR 본문 끝에 `Closes #<번호>`가 붙는다.
+- main 동기화: `run`은 잠금과 원격 동기화 뒤 단계를 계산하기 전에, 작업 브랜치가 `origin/main`보다 뒤처졌으면(`git merge-base --is-ancestor origin/main HEAD`가 거짓) main을 병합한다. `--no-sync`로 건너뛴다.
+  하네스 커밋이 없으면 fast-forward만 한다. 있으면 병합 커밋(`harness(<id>): sync with main`, 트레일러 `Harness-Step: sync`, `Harness-Merged: <origin/main SHA>`)을 만들어 push한다. 트레일러가 가리키는 SHA가 바뀌지 않도록 rebase하지 않고 병합한다.
+  충돌하면 충돌 표시가 든 채로 커밋하고 `Harness-Conflict: <파일 목록>`을 더한다. 다음 단계는 새 implement 라운드이며 프롬프트에 충돌 파일과 "표시를 모두 없애고 양쪽 의도를 보존하라, main 쪽 변경을 되돌리지 마라"가 들어간다. 그 뒤에도 표시가 남아 있으면(`Harness-Conflict`의 파일에 `<<<<<<<` 또는 `>>>>>>>`로 시작하는 줄이 하나라도 있으면. 표시 길이는 git 기본값 7로 고정하고 `.gitattributes`의 `conflict-marker-size`는 읽지 않는다. `=======`는 Markdown 제목 밑줄과 구별할 수 없어 판정에 쓰지 않으므로, 구분선만 남은 불완전한 해결은 코드면 verify가, 문서면 리뷰가 잡는다. 쉼표·따옴표가 든 경로는 `Harness-Conflict`에 큰따옴표로 감싸 적는다) 리뷰로 가지 않고 `충돌 표시가 남아 있습니다: <파일>` 오류(종료 코드 1)로 멈추며, 다시 `run` 하면 implement 라운드로 이어진다. 충돌 표시가 든 커밋은 verify pass가 아니므로 CI 게이트가 통과시키지 않는다.
+  충돌 없는 병합은 review부터 다시 거친다. `done` 작업이 뒤처졌으면 동기화 → review → verify를 다시 하고 열린 PR이 갱신된다. 동기화는 `--max-rounds`에 세지 않고, 충돌 해결 implement는 센다.
+- `git fetch`와 `git worktree add`는 다른 세션이 저장소 락(`index.lock`, `cannot lock ref` 등)을 잡고 있어 실패하면 2초 간격으로 최대 3번 시도한다. 다른 오류는 재시도하지 않는다.
+- `status`는 작업 브랜치가 `origin/main`보다 뒤처졌으면 `behind main: <n> commits` 줄을 더한다.
 
 ### 구독 한도에 따른 자동 배정
 
@@ -320,7 +399,7 @@ AGENTS.md의 규칙은 권고가 아니라 다음 장치로 강제한다.
 | 장치 | 위치 | 막는 것 |
 | --- | --- | --- |
 | 편집 가드 훅 | `.claude/settings.json` → main 체크아웃의 `harness/guard.py` (`git rev-parse --git-common-dir`의 부모에서 찾으며, worktree의 사본은 쓰지 않고 못 찾으면 거부) | Claude의 main 체크아웃 편집(`docs/tasks/*.md` 제외), `.harness/` 편집, 잠금 파일이 implement를 가리키지 않는 worktree 편집 |
-| Bash 가드 | 같은 훅 | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
+| Bash·PowerShell 가드 | 같은 훅 (`Bash`와 `PowerShell` 도구 이벤트를 같은 명령 문자열 검사로 처리) | Claude의 `gh pr merge`, PR 승인 리뷰, `.harness/locks` 수정, `harness-maintenance`를 담은 `gh pr edit`/`gh pr create`/`gh label`/`gh api` |
 | 읽기 전용 spec | `harness/orchestrator.py` | spec 단계 에이전트의 파일 수정 |
 | 명세 PR 머지 | `propose` → `run` | 사람이 머지하지 않은 명세의 구현(`origin/main`에 명세가 없으면 `run`이 거부) |
 | pre-commit 훅 | `.githooks/pre-commit` | `main`/`master` 직접 커밋(충돌 해결 머지 커밋은 허용) |
@@ -336,7 +415,7 @@ GitHub 저장소 설정에서 main 브랜치 보호 규칙을 켜고 `harness-ga
 
 하네스 자체를 유지보수할 때는 에이전트를 띄우는 셸에서 `HARNESS_GUARD=off`를 설정한다(PowerShell: `$env:HARNESS_GUARD='off'`). PR에는 `harness-maintenance` 라벨을 붙인다. 라벨 부여는 사람만 한다. 에이전트가 라벨을 붙이는 명령은 Bash 가드가 거부하지만 문자열 검사라 완전하지 않으므로, 사람이 PR에서 라벨을 확인하는 것이 최종 방어선이다. 라벨 권한 제한은 GitHub 저장소 설정에서 사람이 한다.
 
-한계: Bash 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
+한계: Bash·PowerShell 가드는 명령 문자열만 검사하므로 우회할 수 있고, Bash로 쓰는 일반 파일은 막지 못한다. Codex 대화형 세션도 훅으로 막지 않는다.
 커밋 트레일러는 서명되지 않아 쓰기 권한이 있으면 위조할 수 있다. 최종 방어선은 사람의 PR 검토와 머지, pre-commit 훅, CI 게이트이다.
 
 **Level 3. Multi-Agent Orchestration**

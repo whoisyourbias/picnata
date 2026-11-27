@@ -61,7 +61,7 @@
 
 ## 검증 명령
 
-향후 구현 회귀 검증: `python -m unittest discover -s tests -p test_harness.py`
+python -m unittest discover -s tests -p test_harness.py
 
 ## 가정
 

@@ -5,7 +5,7 @@
 - Task worktree (.harness/worktrees/<id>): only while the lock file .harness/locks/<id>.json
   names an implement step owned by a live process.
 - Files outside this repository: allowed.
-- Bash: no merging or approving pull requests and no touching the lock files.
+- Bash and PowerShell: no merging or approving pull requests and no touching the lock files.
 
 The hook command (.claude/settings.json) always runs the main checkout's copy of this file, found
 through git's common dir, so editing a worktree copy changes nothing; if it is not found, the hook fails closed.
@@ -22,6 +22,7 @@ import sys
 from pathlib import Path, PurePosixPath
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+COMMAND_TOOLS = {"Bash", "PowerShell"}  # shell tools whose command text gets the same checks
 GH_MERGE = re.compile(r"\bgh\b[^|;&\n]*\bpr\s+merge\b")
 GH_APPROVE = re.compile(r"\bgh\b[^|;&\n]*\bpr\s+review\b[^|;&\n]*(?:--approve\b|\s-a\b)")
 GH_LABEL_BYPASS = re.compile(
@@ -134,7 +135,7 @@ def main():
         print("하네스 가드: 훅 입력을 읽을 수 없습니다.", file=sys.stderr)
         return 2
     tool_input = event.get("tool_input") or {}
-    if event.get("tool_name") == "Bash":
+    if event.get("tool_name") in COMMAND_TOOLS:
         reason = decide_bash(str(tool_input.get("command") or ""))
         if reason:
             print(f"하네스 가드: {reason}", file=sys.stderr)

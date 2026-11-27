@@ -110,6 +110,62 @@ class GateTests(unittest.TestCase):
         base = self.full_branch()
         self.assertEqual([], self.check("harness/demo", base))
 
+    def test_branch_with_adopted_human_commit_passes(self):
+        self.base_with_spec()
+        base = self.sha()
+        run_git(self.root, "checkout", "-q", "-b", "harness/demo")
+        self.write("result.txt", "done")
+        implemented = self.step("implement", Harness_Agent="codex", Harness_Round="1")
+        self.step("review", Harness_Reviewed=implemented, Harness_Verdict="REQUEST_CHANGES")
+        self.write(".claude/settings.json", "{}")
+        run_git(self.root, *IDENT, "commit", "-m", "human fix")
+        human = self.sha()
+        adopted = self.step("implement", f"{human[:12]} T human fix", Harness_Agent="human",
+                            Harness_Round="2", Harness_Adopted=f"{human}..{human}")
+        self.step("review", Harness_Reviewed=adopted, Harness_Verdict="APPROVE")
+        self.step("verify", Harness_Verified=adopted, Harness_Result="pass", Harness_Command="x")
+        self.assertEqual([], self.check("harness/demo", base))
+
+    def sync_branch(self, conflict):
+        """implement on harness/demo, then main moves and is merged in by a sync commit.
+
+        Returns the new base (main) SHA."""
+        self.base_with_spec()
+        run_git(self.root, "checkout", "-q", "-b", "harness/demo")
+        self.write("result.txt", "branch\n")
+        self.step("implement", Harness_Agent="codex", Harness_Round="1")
+        run_git(self.root, "checkout", "-q", "main")
+        self.write("result.txt" if conflict else "other.txt", "main\n")
+        run_git(self.root, *IDENT, "commit", "-m", "main moves on")
+        base = self.sha()
+        run_git(self.root, "checkout", "-q", "harness/demo")
+        merge = subprocess.run(["git", *IDENT, "merge", "--no-commit", "--no-ff", "main"], cwd=self.root,
+                               capture_output=True)
+        self.assertEqual(1 if conflict else 0, merge.returncode)
+        run_git(self.root, "add", "-A")
+        extra = {"Harness_Conflict": "result.txt"} if conflict else {}
+        self.step("sync", Harness_Merged=base, **extra)
+        return base
+
+    def test_branch_with_clean_sync_merge_passes(self):
+        base = self.sync_branch(conflict=False)
+        merged = self.sha()
+        self.step("review", Harness_Reviewed=merged, Harness_Verdict="APPROVE")
+        self.step("verify", Harness_Verified=merged, Harness_Result="pass", Harness_Command="x")
+        self.assertEqual([], self.check("harness/demo", base))
+
+    def test_branch_with_resolved_conflict_passes(self):
+        base = self.sync_branch(conflict=True)
+        self.write("result.txt", "resolved\n")
+        resolved = self.step("implement", Harness_Agent="codex", Harness_Round="2")
+        self.step("review", Harness_Reviewed=resolved, Harness_Verdict="APPROVE")
+        self.step("verify", Harness_Verified=resolved, Harness_Result="pass", Harness_Command="x")
+        self.assertEqual([], self.check("harness/demo", base))
+
+    def test_branch_ending_at_a_conflicted_sync_fails(self):
+        base = self.sync_branch(conflict=True)
+        self.assertTrue(self.check("harness/demo", base))
+
     def test_missing_verify_fails(self):
         self.base_with_spec()
         base = self.sha()
