@@ -456,7 +456,22 @@ def plan_next(commits):
     raise ValueError(f"알 수 없는 Harness-Step: {step}")
 
 
-def conflict_files(commits):
+def split_paths(value, worktree=None):
+    """Split a comma-joined path list; commas inside a path are kept when that path exists in worktree."""
+    parts = value.split(",")
+    if worktree is None:
+        return [part for part in parts if part]
+    names, index = [], 0
+    while index < len(parts):
+        end = next((stop for stop in range(len(parts), index, -1)
+                    if (Path(worktree) / ",".join(parts[index:stop])).exists()), index + 1)
+        if name := ",".join(parts[index:end]):
+            names.append(name)
+        index = end
+    return names
+
+
+def conflict_files(commits, worktree=None):
     """Files of conflicted syncs that no review or verify has followed yet, else [].
 
     commits is newest first; implement commits and clean syncs between are skipped, so a clean
@@ -468,7 +483,7 @@ def conflict_files(commits):
         if step == "implement" or (step == "sync" and not trailers.get("Harness-Conflict")):
             continue
         if step == "sync":
-            files += [name for name in trailers["Harness-Conflict"].split(",") if name and name not in files]
+            files += [name for name in split_paths(trailers["Harness-Conflict"], worktree) if name not in files]
             continue
         break
     return files
@@ -1221,7 +1236,7 @@ def run_task(args, cwd):
                     if git(worktree, "rev-parse", "HEAD") != head:
                         commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
-                conflicts = conflict_files(commits)
+                conflicts = conflict_files(commits, worktree)
                 if step == "review" and conflicts and files_with_markers(worktree, conflicts):
                     # Unresolved markers (left by a resolution round, or hidden under a later clean
                     # sync) are never reviewed; resolve again.
@@ -1336,8 +1351,10 @@ def generate_spec(root, state, args, request):
 
     def snapshot():
         # Harness logs live under .harness/; it is gitignored in this repository but may not be elsewhere.
+        # Other sessions may add their own new specs to this shared checkout meanwhile.
         status = [line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
-                  if not line[3:].startswith(".harness/")]
+                  if not line[3:].startswith(".harness/")
+                  and not (line.startswith("?? docs/tasks/") and line.endswith(".md") and line[3:] != task_path)]
         return status, git(root, "diff", "--no-ext-diff", "--no-textconv")
 
     before = snapshot()
