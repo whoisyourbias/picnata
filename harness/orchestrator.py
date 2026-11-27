@@ -574,6 +574,18 @@ def marker_sizes(merged, ours, theirs, base):
     return opening & closing
 
 
+def new_heading_underline(lines, index, merged_lines):
+    """Whether lines[index] is a ======= line that underlines a heading the resolution wrote.
+
+    A leftover separator sits next to lines the sync merge brought (the hunk's content), so a
+    separator-shaped line right below a non-blank text line that the merge did not have is a new
+    Markdown heading underline, not a marker."""
+    if not MARKER_LINE.match(lines[index]).group(2) or index == 0:
+        return False
+    above = lines[index - 1]
+    return bool(above.strip()) and marker_size(above) is None and above not in merged_lines
+
+
 def leftover_markers(current, merged, ours, theirs, base):
     """Whether current (the file now) still holds conflict marker lines that the sync merge wrote.
 
@@ -581,7 +593,8 @@ def leftover_markers(current, merged, ours, theirs, base):
     side brought, and a line both sides added identically only once, so the legitimate copies of a
     marker-shaped line are its copies in merged minus the markers git wrote there: per conflict hunk
     one opening, one separator and one closing line (and a base marker in diff3 style). Taking one
-    side wholesale is also allowed. Lines of a size git did not use in the merge are not markers."""
+    side wholesale is also allowed. Lines of a size git did not use in the merge are not markers,
+    and neither is the underline of a heading the resolution wrote (new_heading_underline)."""
     sizes = marker_sizes(merged, ours, theirs, base)
     if not sizes:
         return False
@@ -594,8 +607,10 @@ def leftover_markers(current, merged, ours, theirs, base):
                 hunks[len(run)] += extra
     for size, count in hunks.items():
         written["=" * size] += count
+    merged_lines = set(merged)
     merged, ours, theirs = Counter(merged), Counter(ours), Counter(theirs)
-    counts = Counter(line for line in current if marker_size(line) in sizes)
+    counts = Counter(line for index, line in enumerate(current)
+                     if marker_size(line) in sizes and not new_heading_underline(current, index, merged_lines))
     return any(count > max(ours[line], theirs[line], merged[line] - written[line])
                for line, count in counts.items())
 

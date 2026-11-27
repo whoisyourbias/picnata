@@ -1975,6 +1975,48 @@ class SyncTests(GitFlowTestCase):
                                                       merged, ours, theirs, base))
         self.assertFalse(orchestrator.leftover_markers(["Title", "=======", "A", "B"], merged, ours, theirs, base))
         self.assertFalse(orchestrator.leftover_markers(ours, merged, ours, theirs, base))
+        # A heading the resolution adds brings its own underline; it is not a leftover separator.
+        self.assertFalse(orchestrator.leftover_markers(
+            ["Title", "=======", "A", "B", "", "Summary", "=======", "C"], merged, ours, theirs, base))
+        # A separator left in place is still found next to the new heading.
+        self.assertTrue(orchestrator.leftover_markers(
+            ["Title", "=======", "A", "=======", "B", "", "Summary", "=======", "C"], merged, ours, theirs, base))
+        # A separator below a blank line underlines nothing.
+        self.assertTrue(orchestrator.leftover_markers(
+            ["Title", "=======", "A", "", "=======", "B"], merged, ours, theirs, base))
+
+    def test_new_heading_underline_after_combining_both_sides_reaches_review(self):
+        # Both sides add the same Title heading; the implementer combines the paragraphs, removes
+        # every marker and adds a Summary heading with its own ======= underline.
+        self.merge_spec()
+        base = self.agent(crash_review=True)
+
+        def first(agent, phase, prompt, cwd, log, timeout):
+            final = base(agent, phase, prompt, cwd, log, timeout)
+            if phase == "implement":
+                (Path(cwd) / "result.txt").write_text("Title\n=======\nfrom branch\n", encoding="utf-8")
+            return final
+
+        with patch.object(orchestrator, "run_agent", side_effect=first):
+            self.assertEqual(1, self.run_cli())
+        self.calls.clear()
+        self.advance_main("result.txt", "Title\n=======\nfrom main\n")
+        base = self.agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            if phase == "implement" and "Merge conflicts with main" in prompt:
+                self.calls.append((agent, phase, prompt))
+                (Path(cwd) / "result.txt").write_text(
+                    "Title\n=======\nfrom branch\nfrom main\n\nSummary\n=======\nboth kept\n", encoding="utf-8")
+                final = log.with_name(log.stem + "-final.md")
+                final.write_text("충돌을 다뤘습니다.", encoding="utf-8")
+                return final
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        self.assertIn("review", [phase for _, phase, _ in self.calls])
+        self.assertEqual(("verify", "pass"), self.steps()[-1])
 
     def test_sync_is_not_counted_but_conflict_resolution_is(self):
         self.interrupt()
