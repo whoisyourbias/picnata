@@ -1016,7 +1016,10 @@ class Task:
                          if c["trailers"].get("Harness-Step") == "review"), None)
         if previous is None:
             return ""
-        findings = review_section(message_body(previous["message"]), "blocking") or "None"
+        # An approved review has no open blocking findings, whatever its Blocking section says.
+        findings = "None"
+        if previous["trailers"].get("Harness-Verdict") != "APPROVE":
+            findings = review_section(message_body(previous["message"]), "blocking") or "None"
         reviewed = previous["trailers"].get("Harness-Reviewed")
         changes = "Not available; review the full diff above."
         if reviewed and git_ok(self.worktree, "merge-base", "--is-ancestor", reviewed, "HEAD"):

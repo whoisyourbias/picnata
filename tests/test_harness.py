@@ -900,7 +900,9 @@ class RunTests(GitFlowTestCase):
     def test_rework_round_after_approve_lists_no_previous_blocking(self):
         self.merge_spec()
         approve = "## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
-        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent([approve, approve])):
+        # An approval whose Blocking section still holds a stale draft finding.
+        stale = "## Blocking\n- stale draft finding\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent([stale])):
             self.assertEqual(0, self.run_cli(), self.stderr)
         # A human change after the approved review is adopted and reviewed again.
         (self.worktree / "human.txt").write_text("human line\n", encoding="utf-8")
@@ -914,6 +916,7 @@ class RunTests(GitFlowTestCase):
         changes = prompt.partition("Changes since the previous review\n")[2]
         self.assertIn("+human line", changes)
         self.assertNotIn("round 1", changes)
+        self.assertNotIn("stale draft finding", prompt[len(orchestrator.REVIEW_INSTRUCTIONS):])
 
     def test_rework_round_without_reviewed_commit_in_history(self):
         self.merge_spec()
