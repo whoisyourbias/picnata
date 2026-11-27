@@ -1401,7 +1401,7 @@ class SyncPlanTests(unittest.TestCase):
 
     def test_conflict_syncs_names_both_parents_of_each_sync(self):
         sync = {"sha": "s" * 40, "message": "", "trailers": {"Harness-Step": "sync", "Harness-Conflict": "a.txt"}}
-        self.assertEqual({"a.txt": [("s" * 40 + "^1", "s" * 40 + "^2")]},
+        self.assertEqual({"a.txt": [("s" * 40, "s" * 40 + "^1", "s" * 40 + "^2")]},
                          orchestrator.conflict_syncs([sync, fake_commit("implement")]))
 
 
@@ -1522,6 +1522,70 @@ class ClaimTests(GitFlowTestCase):
             self.assertEqual(1, self.cli("from-issue", "5", "codex"))
         self.assertIn("changed files during the read-only spec step", self.stderr)
         self.assertFalse(self.issue_spec.exists())
+
+    def test_same_issue_drafted_by_another_session_during_the_run_is_kept(self):
+        self.issue()
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            # Another from-issue 5 session passed the claim checks too and wrote its draft first.
+            orchestrator.write_spec_draft(self.state, "issue-5", self.issue_spec, "# 먼저 쓴 세션\n")
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(4, self.cli("from-issue", "5", "codex"))
+        self.assertEqual("# 먼저 쓴 세션\n", self.issue_spec.read_text(encoding="utf-8"))
+        self.assertFalse((self.gh_state / "comment.md").exists())
+
+    def test_draft_written_after_the_final_check_is_kept(self):
+        self.issue()
+        real = orchestrator.write_spec_draft
+
+        def racing(state, task_id, target, spec):
+            # The other session writes between this session's last check and its write.
+            real(state, task_id, target, "# 먼저 쓴 세션\n")
+            return real(state, task_id, target, spec)
+
+        questions = SPEC.replace("## 열린 질문\n없음", "## 열린 질문\n- 무엇을 할까요?")
+        with patch.object(orchestrator, "run_agent", side_effect=self.spec_agent(questions)), \
+                patch.object(orchestrator, "write_spec_draft", side_effect=racing):
+            self.assertEqual(4, self.cli("from-issue", "5", "codex"))
+        self.assertEqual("# 먼저 쓴 세션\n", self.issue_spec.read_text(encoding="utf-8"))
+        self.assertFalse((self.gh_state / "comment.md").exists())
+
+    def test_agent_deleting_another_draft_is_rejected_despite_old_logs(self):
+        self.issue()
+        other = self.root / "docs" / "tasks" / "issue-6.md"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        orchestrator.write_spec_draft(self.state, "issue-6", other, "# 다른 세션\n")
+        (self.state / "logs" / "issue-6" / "spec-old.log").touch()
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            other.unlink()
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(1, self.cli("from-issue", "5", "codex"))
+        self.assertIn("changed files during the read-only spec step", self.stderr)
+        self.assertFalse(self.issue_spec.exists())
+
+    def test_propose_removing_its_pushed_copy_is_tolerated(self):
+        self.issue()
+        other = self.root / "docs" / "tasks" / "issue-6.md"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        orchestrator.write_spec_draft(self.state, "issue-6", other, "# 다른 세션\n")
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            # Another session's propose issue-6 records the bytes it deletes, then deletes them.
+            orchestrator.record_draft(self.state, "issue-6", "removed", other.read_bytes())
+            other.unlink()
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(0, self.cli("from-issue", "5", "codex"), self.stderr)
+        self.assertEqual(SPEC, self.issue_spec.read_text(encoding="utf-8"))
 
     def test_without_gh_exits_with_1(self):
         with patch.object(orchestrator, "gh_available", return_value=None):
@@ -1789,6 +1853,27 @@ class SyncTests(GitFlowTestCase):
         self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
         sync = self.branch_commits()[1]
         self.assertIn("<" * 10, run_git(self.worktree, "show", f"{sync['sha']}:result.txt"))
+        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+
+    def test_changing_the_marker_size_does_not_hide_leftover_markers(self):
+        self.interrupt()
+        self.advance_main("result.txt", "from main\n")
+        base = self.agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            if phase == "implement" and "Merge conflicts with main" in prompt:
+                self.calls.append((agent, phase, prompt))
+                # Leave the seven-character markers and make git look for ten-character ones.
+                (Path(cwd) / ".gitattributes").write_text("result.txt conflict-marker-size=10\n", encoding="utf-8")
+                final = log.with_name(log.stem + "-final.md")
+                final.write_text("충돌을 다뤘습니다.", encoding="utf-8")
+                return final
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(1, self.run_cli())
+        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
+        self.assertIn("<<<<<<<", (self.worktree / "result.txt").read_text(encoding="utf-8"))
         self.assertNotIn("review", [phase for _, phase, _ in self.calls])
 
     def test_heading_underline_from_main_is_not_a_marker(self):

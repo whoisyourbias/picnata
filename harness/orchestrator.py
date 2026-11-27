@@ -472,11 +472,11 @@ def split_paths(value, worktree=None):
 
 
 def conflict_syncs(commits, worktree=None):
-    """{file: [(ours, theirs), ...]} for the conflicted syncs that no review or verify has followed yet.
+    """{file: [(sync, ours, theirs), ...]} for the conflicted syncs that no review or verify has followed yet.
 
     commits is newest first; implement commits and clean syncs between are skipped, so a clean
     sync cannot hide an earlier conflict that is still unresolved. ours and theirs are the two
-    parents of the sync merge that named the file."""
+    parents of the sync merge that named the file, sync is the merge itself."""
     found = {}
     for commit in commits:
         trailers = commit["trailers"]
@@ -484,8 +484,9 @@ def conflict_syncs(commits, worktree=None):
         if step == "implement" or (step == "sync" and not trailers.get("Harness-Conflict")):
             continue
         if step == "sync":
+            sha = commit["sha"]
             for name in split_paths(trailers["Harness-Conflict"], worktree):
-                found.setdefault(name, []).append((f"{commit['sha']}^1", f"{commit['sha']}^2"))
+                found.setdefault(name, []).append((sha, f"{sha}^1", f"{sha}^2"))
             continue
         break
     return found
@@ -496,36 +497,54 @@ def conflict_files(commits, worktree=None):
     return list(conflict_syncs(commits, worktree))
 
 
-LEFTOVER_MARKER = re.compile(r":(\d+): leftover conflict marker\s*$")
+MARKER_LINE = re.compile(r"^(?:(<+|>+|\|+)(?: .*)?|(=+))$")
 
 
-def marker_lines(worktree, base, name):
-    """Worktree line numbers of name that git reports as conflict markers added relative to base.
+def text_lines(data):
+    return [line.rstrip("\r") for line in data.decode("utf-8", errors="replace").split("\n")]
 
-    git decides what a marker is: <<<<<<<, =======, >>>>>>> and ||||||| lines of the file's
-    conflict-marker-size (from .gitattributes, default 7)."""
-    result = subprocess.run(
-        ["git", "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-color", "--check", base, "--", name],
-        cwd=worktree, capture_output=True, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-    if result.returncode > 3:
-        message = result.stderr.decode("utf-8", errors="replace").strip()
-        raise ValueError(message or "git diff --check failed")
-    return {int(match.group(1)) for line in result.stdout.decode("utf-8", errors="replace").splitlines()
-            if (match := LEFTOVER_MARKER.search(line))}
+
+def blob_lines(worktree, revision, name):
+    """Lines of name at revision, or [] when the file does not exist there."""
+    result = subprocess.run(["git", "cat-file", "blob", f"{revision}:{name}"], cwd=worktree,
+                            capture_output=True, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return text_lines(result.stdout) if result.returncode == 0 else []
+
+
+def marker_sizes(merged, ours, theirs):
+    """The conflict marker sizes git wrote into a sync merge: an opening and a closing marker of the
+    same length that neither parent had. Read from the sync commit itself, so attributes changed
+    later (conflict-marker-size in .gitattributes, say) cannot hide the markers it holds."""
+    known = set(ours) | set(theirs)
+    opening, closing = set(), set()
+    for line in merged:
+        if line in known or not (match := MARKER_LINE.match(line)) or not match.group(1):
+            continue
+        run = match.group(1)
+        (opening if run[0] == "<" else closing if run[0] == ">" else set()).add(len(run))
+    return opening & closing
 
 
 def files_with_markers(worktree, syncs):
     """The conflicted files (conflict_syncs) that still hold conflict markers.
 
-    A marker line counts only when it is new relative to both sides of a sync that named the file,
-    so a ======= line (a Markdown heading underline, say) that either side already had is content."""
+    A marker line counts only when it has a size git used in a sync that named the file and is new
+    relative to both of that sync's parents, so a ======= line (a Markdown heading underline, say)
+    that either side already had is content."""
     found = []
-    for name, bases in syncs.items():
-        if not (Path(worktree) / name).is_file():
+    for name, syncs_of_file in syncs.items():
+        path = Path(worktree) / name
+        if not path.is_file():
             continue
-        if any(marker_lines(worktree, ours, name) & marker_lines(worktree, theirs, name)
-               for ours, theirs in bases):
-            found.append(name)
+        current = text_lines(path.read_bytes())
+        for sync, ours, theirs in syncs_of_file:
+            ours_lines, theirs_lines = blob_lines(worktree, ours, name), blob_lines(worktree, theirs, name)
+            sizes = marker_sizes(blob_lines(worktree, sync, name), ours_lines, theirs_lines)
+            known = set(ours_lines) | set(theirs_lines)
+            if any(line not in known and (match := MARKER_LINE.match(line))
+                   and len(match.group(1) or match.group(2)) in sizes for line in current):
+                found.append(name)
+                break
     return found
 
 
@@ -849,7 +868,7 @@ def propose(args, cwd):
     if issue := ISSUE_TASK.fullmatch(args.id):
         body += f"\nRefs #{issue.group(1)}\n"
     open_pr(main_root, branch, f"spec: {title}", body)
-    if remove_pushed_copy(main_root, task_path, blob):
+    if remove_pushed_copy(main_root, task_path, blob, state):
         print(f"로컬 사본을 지웠습니다. 수정하려면: git show origin/{branch}:{task_path} > {task_path}")
         print(f"Windows PowerShell에서는 인코딩이 바뀌지 않게: "
               f"git restore --source=origin/{branch} --worktree -- {task_path}")
@@ -857,9 +876,12 @@ def propose(args, cwd):
     return 0
 
 
-def remove_pushed_copy(main_root, task_path, blob):
+def remove_pushed_copy(main_root, task_path, blob, state=None):
     """Delete the untracked specification left in the main checkout once it matches the pushed blob,
-    so a later git pull of the merged specification is not blocked by it."""
+    so a later git pull of the merged specification is not blocked by it.
+
+    With state, the deleted bytes of a draft a spec run produced are recorded first, so a concurrent
+    read-only spec run of another task can tell this deletion from one made by its agent."""
     target = main_root / task_path
     if not target.is_file() or not is_untracked(main_root, task_path):
         return False
@@ -885,6 +907,9 @@ def remove_pushed_copy(main_root, task_path, blob):
         matches = False
     if matches:
         try:
+            # Only a draft some spec run produced (its logs exist) may be deleted under a spec run.
+            if state is not None and (state / "logs" / Path(task_path).stem).is_dir():
+                record_draft(state, Path(task_path).stem, "removed", candidate.read_bytes())
             candidate.unlink()
         except OSError as exc:
             print(f"로컬 사본을 지우지 못해 남겨 둡니다 ({target}): {exc}")
@@ -1375,19 +1400,42 @@ def write_spec(args, cwd):
     return 0
 
 
-def draft_record(state, task_id):
-    """Where the harness records the SHA-256 of the spec draft it writes for task_id."""
-    return state / "logs" / task_id / "spec-draft.sha256"
+def draft_records(state, task_id, kind):
+    """Where the harness records the SHA-256 of spec drafts it wrote ("written") or, in propose,
+    deleted ("removed") for task_id: one file per event, named <sha256>-<unique>, so concurrent
+    sessions never overwrite each other's records."""
+    return state / "logs" / task_id / f"spec-drafts-{kind}"
+
+
+def record_draft(state, task_id, kind, data):
+    directory = draft_records(state, task_id, kind)
+    directory.mkdir(parents=True, exist_ok=True)
+    record = directory / f"{hashlib.sha256(data).hexdigest()}-{uuid4().hex}"
+    record.touch()
+    return record
+
+
+def recorded(state, task_id, kind, data):
+    """The records of kind for exactly these bytes."""
+    directory = draft_records(state, task_id, kind)
+    digest = hashlib.sha256(data).hexdigest()
+    return set(directory.glob(f"{digest}-*")) if directory.is_dir() else set()
 
 
 def write_spec_draft(state, task_id, target, spec):
     """Write the draft (text mode line endings, as before) after recording its exact bytes' hash,
-    so a concurrent spec run of another task sees the record before the file appears."""
+    so a concurrent spec run of another task sees the record before the file appears.
+
+    The file is created exclusively: when another session wrote the same draft first, its file is
+    kept and Claimed is raised."""
     data = spec.replace("\n", os.linesep).encode("utf-8")
-    record = draft_record(state, task_id)
-    record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(hashlib.sha256(data).hexdigest() + "\n", encoding="ascii")
-    target.write_bytes(data)
+    record_draft(state, task_id, "written", data)
+    try:
+        with open(target, "xb") as handle:
+            handle.write(data)
+    except FileExistsError as exc:
+        raise Claimed(f"{target}가 그사이에 생겼습니다. 같은 PC의 다른 세션이 먼저 쓴 명세이므로 "
+                      "남겨 둡니다.") from exc
 
 
 def generate_spec(root, state, args, request):
@@ -1412,25 +1460,40 @@ def generate_spec(root, state, args, request):
         other = name[len("docs/tasks/"):-len(".md")]
         return None if "/" in other or other == args.id else other
 
-    def other_session_draft(line):
-        # Other sessions may add their own new specs to this shared checkout meanwhile. A new draft is
-        # tolerated only when the harness recorded exactly these bytes under .harness before writing
-        # them (agents cannot write there); an old log or record does not vouch for other content.
-        other = other_task(line)
-        record = draft_record(state, other) if other else None
+    def written_by_harness(task, name):
+        # A draft is the harness's only when it recorded exactly these bytes under .harness before
+        # writing them (agents cannot write there); an old log or record does not vouch for other content.
         try:
-            return bool(record) and record.read_text(encoding="ascii").strip() == \
-                hashlib.sha256((root / line[3:]).read_bytes()).hexdigest()
+            return bool(recorded(state, task, "written", (root / name).read_bytes()))
         except OSError:
             return False
 
-    def other_session_removal(line):
-        # propose deletes its pushed local copy; only a draft some spec run produced may disappear.
+    def other_session_draft(line):
+        # Other sessions may add their own new specs to this shared checkout meanwhile.
         other = other_task(line)
-        logs = state / "logs" / other if other else None
-        return bool(logs) and logs.is_dir() and any(logs.glob("spec-*.log"))
+        return bool(other) and written_by_harness(other, line[3:])
 
+    def drafts_of_other_tasks(status):
+        found = {}
+        for line in status:
+            if other := other_task(line):
+                try:
+                    found[line] = (other, (root / line[3:]).read_bytes())
+                except OSError:
+                    pass
+        return found
+
+    def other_session_removal(line):
+        # propose deletes its pushed local copy after recording the deleted bytes; a deletion is
+        # tolerated only when such a record for exactly the bytes seen before the run was made just now.
+        if line not in drafts:
+            return False
+        other, data = drafts[line]
+        return any(record.stat().st_mtime >= started - 60 for record in recorded(state, other, "removed", data))
+
+    started = time.time()
     before = snapshot()
+    drafts = drafts_of_other_tasks(before[0])
     log = state / "logs" / args.id / f"spec-{uuid4().hex}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.touch()
@@ -1441,6 +1504,10 @@ def generate_spec(root, state, args, request):
         raise ValueError(f"{exc} (log: {log})") from exc
     # The agent runs read-only; this check is a second line of defence.
     after = snapshot()
+    own = f"?? {task_path}"
+    if own in after[0] - before[0] and written_by_harness(args.id, task_path):
+        # Another session of the same task wrote its draft first; keep it.
+        raise Claimed(f"{task_path}가 그사이에 생겼습니다. 같은 PC의 다른 세션이 먼저 쓴 명세이므로 남겨 둡니다.")
     added = [line for line in after[0] - before[0] if not other_session_draft(line)]
     removed = [line for line in before[0] - after[0] if not other_session_removal(line)]
     if added or removed or after[1] != before[1] or target.exists():
