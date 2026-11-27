@@ -1398,6 +1398,15 @@ class SyncPlanTests(unittest.TestCase):
         self.assertEqual([], orchestrator.conflict_files(
             [fake_commit("review")] + commits))
 
+    def test_setext_underline_is_not_a_conflict_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "resolved.md").write_text("Title\n=======\n\ntext\n", encoding="utf-8")
+            (root / "open.md").write_text("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> main\n", encoding="utf-8")
+            (root / "half.md").write_text("a\n>>>>>>> origin/main\n", encoding="utf-8")
+            self.assertEqual(["open.md", "half.md"],
+                             orchestrator.files_with_markers(root, ["resolved.md", "open.md", "half.md"]))
+
 
 class LockRetryTests(unittest.TestCase):
     def test_fetch_retries_after_lock_contention(self):
@@ -1468,6 +1477,37 @@ class ClaimTests(GitFlowTestCase):
             self.assertEqual(1, self.cli("from-issue", "6", "codex"))
             agent.assert_not_called()
         self.assertFalse(self.issue_spec.exists())
+
+    def test_spec_agent_writing_another_task_file_is_rejected(self):
+        self.issue()
+        other = self.root / "docs" / "tasks" / "issue-6.md"
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            other.write_text("# 끼어든 명세\n", encoding="utf-8")
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(1, self.cli("from-issue", "5", "codex"))
+        self.assertIn("changed files during the read-only spec step", self.stderr)
+        self.assertFalse(self.issue_spec.exists())
+
+    def test_another_sessions_spec_draft_is_tolerated(self):
+        self.issue()
+        other = self.root / "docs" / "tasks" / "issue-6.md"
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            # Another session's from-issue 6 logs its spec run under .harness and then writes its draft.
+            logs = self.state / "logs" / "issue-6"
+            logs.mkdir(parents=True, exist_ok=True)
+            (logs / "spec-x.log").touch()
+            other.write_text("# 다른 세션\n", encoding="utf-8")
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(0, self.cli("from-issue", "5", "codex"), self.stderr)
+        self.assertEqual(SPEC, self.issue_spec.read_text(encoding="utf-8"))
 
     def test_without_gh_exits_with_1(self):
         with patch.object(orchestrator, "gh_available", return_value=None):
@@ -1650,6 +1690,15 @@ class SyncTests(GitFlowTestCase):
         self.assertTrue((self.worktree / "other.txt").exists())
         self.assertEqual(run_git(self.worktree, "rev-parse", "HEAD"), run_git(self.origin, "rev-parse", "harness/demo"))
         self.assertEqual("review", self.calls[0][1])
+
+    def test_review_after_sync_goes_to_the_counterpart_of_the_implementer(self):
+        self.interrupt()  # implemented by codex
+        self.advance_main("other.txt", "x\n")
+        with patch.object(orchestrator, "run_agent", side_effect=self.agent()):
+            self.assertEqual(0, self.cli("run", "demo", "claude"), self.stderr)
+        self.assertEqual(("claude", "review"), self.calls[0][:2])
+        review = next(c for c in self.branch_commits() if c["trailers"]["Harness-Step"] == "review")
+        self.assertEqual("claude", review["trailers"]["Harness-Agent"])
 
     def test_conflict_is_committed_and_resolved_by_a_new_implement_round(self):
         self.assertEqual(0, self.conflicted_run(), self.stderr)

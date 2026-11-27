@@ -67,7 +67,9 @@ class Claimed(ValueError):
 ISSUE_TASK = re.compile(r"issue-([1-9][0-9]*)")
 LOCK_RETRIES = 3
 LOCK_RETRY_DELAY = 2
-CONFLICT_OPEN = re.compile(r"^(<{7}|={7}|>{7})(?: |$)", re.MULTILINE)
+# Only the opening and closing markers count: a bare ======= line is also a valid Markdown
+# Setext heading underline, and git never writes it without the surrounding <<<<<<< and >>>>>>>.
+CONFLICT_OPEN = re.compile(r"^(<{7}|>{7})(?: |$)", re.MULTILINE)
 COMMENT_HEADER = "하네스 명세 초안의 열린 질문입니다. 답을 이 이슈에 남기거나 세션에서 알려 주세요."
 
 BLOCKING_LINE = re.compile(r"BLOCKING: (\d+)")
@@ -1259,7 +1261,10 @@ def run_task(args, cwd):
                 if step == "implement":
                     sha, result = task.implement(round_number, last, log, conflicts), None
                 elif step == "review":
-                    sha, result = task.review(log, last)
+                    # A sync commit has no implementer; the reviewer stays the counterpart of the last
+                    # implement round so a sync never sends work back to the agent that wrote it.
+                    implemented = next((c for c in commits if c["trailers"].get("Harness-Step") == "implement"), last)
+                    sha, result = task.review(log, implemented)
                 else:
                     sha, result = task.verify(commits, log)
                 print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
@@ -1351,11 +1356,21 @@ def generate_spec(root, state, args, request):
 
     def snapshot():
         # Harness logs live under .harness/; it is gitignored in this repository but may not be elsewhere.
-        # Other sessions may add their own new specs to this shared checkout meanwhile.
+        # Other sessions may add their own new specs to this shared checkout meanwhile; such a draft is
+        # tolerated only when its own spec run left a log under .harness (agents cannot write there).
         status = [line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
-                  if not line[3:].startswith(".harness/")
-                  and not (line.startswith("?? docs/tasks/") and line.endswith(".md") and line[3:] != task_path)]
+                  if not line[3:].startswith(".harness/") and not other_session_spec(line)]
         return status, git(root, "diff", "--no-ext-diff", "--no-textconv")
+
+    def other_session_spec(line):
+        name = line[3:]
+        if not (line.startswith("?? docs/tasks/") and name.endswith(".md")) or name == task_path:
+            return False
+        other = name[len("docs/tasks/"):-len(".md")]
+        if "/" in other or other == args.id:
+            return False
+        logs = state / "logs" / other
+        return logs.is_dir() and any(logs.glob("spec-*.log"))
 
     before = snapshot()
     log = state / "logs" / args.id / f"spec-{uuid4().hex}.log"
