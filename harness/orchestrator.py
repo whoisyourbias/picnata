@@ -18,6 +18,9 @@ from pathlib import Path
 from uuid import uuid4
 
 
+from harness import selection
+
+
 OTHER_AGENT = {"claude": "codex", "codex": "claude"}
 
 NOTES_LIMIT = 8000
@@ -258,27 +261,12 @@ IMPLEMENT_COMMAND_GUIDE = (
 )
 
 
-def run_agent(agent, phase, prompt, cwd, log, timeout):
-    """Run an agent and return the path of a file holding its final message."""
-    read_only = phase in READ_ONLY_PHASES
+def agent_runtime(agent):
     env = None
-    final = log
-    stdout_path = None
     if agent == "claude":
         native_claude = Path.home() / ".local" / "bin" / "claude.exe"
         executable = shutil.which("claude") or (str(native_claude) if native_claude.is_file() else "claude")
-        if phase == "spec":
-            command = [executable, "-p", "--permission-mode", "default",
-                       "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"]
-        else:
-            command = [executable, "-p", "--permission-mode", "plan" if read_only else "acceptEdits"]
-        if phase == "implement":
-            command += ["--allowedTools", ",".join(CLAUDE_IMPLEMENT_ALLOWED_TOOLS)]
-        # stdout is the final response; stderr diagnostics stay in the local log only.
-        final = log.with_name(log.stem + "-final.md")
-        stdout_path = final
     else:
-        mode = "read-only" if read_only else "workspace-write"
         executable = shutil.which("codex") or "codex"
         if sys.platform == "win32" and os.environ.get("CODEX_WINDOWS_REGISTERED_CORE") == "1":
             # A Desktop-launched subprocess does not carry the Desktop MSIX identity.
@@ -292,12 +280,134 @@ def run_agent(agent, phase, prompt, cwd, log, timeout):
             env = os.environ.copy()
             env.pop("CODEX_WINDOWS_REGISTERED_CORE", None)
             env.pop("CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY", None)
+    return executable, env
+
+
+def run_agent(agent, phase, prompt, cwd, log, timeout, choice=None):
+    """Run an agent and return the path of a file holding its final message."""
+    read_only = phase in READ_ONLY_PHASES
+    executable, env = agent_runtime(agent)
+    final = log
+    stdout_path = None
+    if agent == "claude":
+        if phase == "spec":
+            command = [executable, "-p", "--permission-mode", "default",
+                       "--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash"]
+        else:
+            command = [executable, "-p", "--permission-mode", "plan" if read_only else "acceptEdits"]
+        if phase == "implement":
+            command += ["--allowedTools", ",".join(CLAUDE_IMPLEMENT_ALLOWED_TOOLS)]
+        # stdout is the final response; stderr diagnostics stay in the local log only.
+        final = log.with_name(log.stem + "-final.md")
+        stdout_path = final
+    else:
+        mode = "read-only" if read_only else "workspace-write"
         command = [executable, "-a", "never", "exec", "-s", mode]
         final = log.with_name(log.stem + "-final.md")
         command += ["-o", str(final)]
         command.append("-")
-    run_logged(command, cwd, log, timeout, prompt, env=env, stdout_path=stdout_path)
+    if choice:
+        flags = ["--model", choice.model]
+        if agent == "claude":
+            if choice.effort != "default":
+                flags += ["--effort", choice.effort]
+            command += flags + ["--output-format", "json"]
+            stdout_path = log.with_suffix(".result.json")
+        else:
+            if choice.effort != "default":
+                flags += ["-c", f'model_reasoning_effort="{choice.effort}"']
+            command[-1:-1] = flags + ["--json"]
+    if not choice:
+        run_logged(command, cwd, log, timeout, prompt, env=env, stdout_path=stdout_path)
+        return final
+
+    started = time.monotonic()
+    try:
+        run_logged(command, cwd, log, timeout, prompt, env=env, stdout_path=stdout_path)
+    except ValueError as exc:
+        if re.search(r"usage.limit|rate.limit|quota.exceeded|hit your.*limit", read_text_tail(log), re.I):
+            raise QuotaReached("Subscription limit reached. Retry after reset.") from exc
+        raise
+    finally:
+        record_attempt(agent, log, final, stdout_path, started)
+    if not final.is_file():
+        raise ValueError(f"{agent} did not complete the stage")
     return final
+
+
+class QuotaReached(ValueError):
+    """The provider stopped an active attempt at its subscription limit."""
+
+
+def record_attempt(agent, log, final, stdout_path, started):
+    usage = {}
+    failure = ""
+    if agent == "claude" and stdout_path.is_file() and stdout_path.stat().st_size:
+        result = json.loads(stdout_path.read_text(encoding="utf-8"))
+        usage = result.get("usage") or {}
+        thinking = [m["thinkingTokens"] for m in result.get("modelUsage", {}).values() if "thinkingTokens" in m]
+        if thinking:
+            usage["reasoning_output_tokens"] = sum(thinking)
+        if result.get("is_error"):
+            failure = str(result.get("result") or result.get("errors") or "Claude failed")
+        elif isinstance(result.get("result"), str):
+            final.write_text(result["result"], encoding="utf-8")
+    elif agent == "codex":
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if event.get("type") == "turn.failed":
+                    failure = str(event.get("error") or "Codex turn failed")
+                if event.get("type") == "turn.completed":
+                    for key, value in (event.get("usage") or {}).items():
+                        if type(value) is int:
+                            usage[key] = usage.get(key, 0) + value
+    record_path = log.with_suffix(".json")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["elapsed_seconds"] = time.monotonic() - started
+    record["tokens"] = {key: usage.get(key) for key in
+                        ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens",
+                         "cache_read_input_tokens", "cache_creation_input_tokens")}
+    record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    if re.search(r"usage.limit|rate.limit|quota.exceeded|hit your.*limit", failure, re.I):
+        raise QuotaReached(failure)
+    if failure:
+        raise ValueError(failure)
+
+
+def verification_metrics(commits, log, result):
+    """Pool attempts by provider and task tier, keeping token components separate."""
+    groups = {}
+    for path in log.parent.parent.glob("*/*.json"):
+        if path.suffixes[-2:] == [".result", ".json"] or path.stem.startswith("verify-"):
+            continue
+        try:
+            attempt = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            # A previous process may have stopped while writing its local telemetry.
+            continue
+        selected = attempt.get("selected")
+        if not selected or "tokens" not in attempt:
+            continue
+        key = attempt["tier"], selected["agent"], attempt["phase"]
+        group = groups.setdefault(key, {"tier": key[0], "agent": key[1], "phase": key[2],
+                                        "attempts": 0, "elapsed_seconds": 0, "tokens": {}})
+        group["attempts"] += 1
+        group["elapsed_seconds"] += attempt["elapsed_seconds"]
+        for token, value in attempt["tokens"].items():
+            total = group["tokens"].get(token, 0)
+            group["tokens"][token] = None if total is None or value is None else total + value
+    history = [c["trailers"] for c in reversed(commits)]
+    first = next((t["Harness-Result"] for t in history if t.get("Harness-Step") == "verify"), result)
+    metrics = {"result": result, "first_verification_passed": first == "pass",
+               "review_reworks": sum(t.get("Harness-Verdict") == "REQUEST_CHANGES" for t in history),
+               "local_attempts": list(groups.values())}
+    log.with_suffix(".json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
 
 def extract_spec(text):
@@ -377,6 +487,10 @@ def verify_command(spec):
         text = " ".join(pieces)
     else:
         text = next((line.strip() for line in candidates if line.strip()), "")
+        # A specification can label its single inline command, e.g. 회귀 검증: `python ...`.
+        labelled = re.fullmatch(r"[^`:]+:\s+`([^`]+)`", text)
+        if labelled:
+            text = labelled[1]
     if len(text) > 1 and text.startswith("`") and text.endswith("`"):
         text = text[1:-1].strip()
     command = shlex.split(text) if text else []
@@ -1091,6 +1205,20 @@ def trees_equal(worktree, first, second):
     return git(worktree, "rev-parse", f"{first}^{{tree}}") == git(worktree, "rev-parse", f"{second}^{{tree}}")
 
 
+EVIDENCE_PROMPT = ("\nIf analysis at this setting could not resolve a review or verification issue, "
+                   "include a line 'UNRESOLVED: <issue>' and 'EVIDENCE: <failed analysis>'. "
+                   "Use these lines only for unresolved code issues.")
+
+
+def unresolved(message):
+    issue = re.search(r"^UNRESOLVED: (\S.*)$", message, re.M)
+    evidence = re.search(r"^EVIDENCE: (\S.*)$", message, re.M)
+    if not issue or not evidence:
+        return False
+    external = r"rate.limit|usage.limit|quota|authenticat|credentials|environment|환경 오류|구독 한도|인증 오류"
+    return not re.search(external, issue[1] + " " + evidence[1], re.I)
+
+
 def adopt_human_commits(worktree, task_id, commits, spec_path):
     """Record the trailerless commits after the last harness commit as a new implement round by
     Harness-Agent: human, so review and verify run on them next. commits is newest first.
@@ -1152,6 +1280,36 @@ class Task:
         self.spec_path, self.spec = spec_path, spec
         self.command_text, self.command = command_text, command
 
+        self.choice = None
+        self.raised = False
+
+    def settings(self):
+        if not self.choice:
+            return []
+        return [("Harness-Model", self.choice.model), ("Harness-Effort", self.choice.effort),
+                ("Harness-Raised", str(self.raised).lower())]
+
+    def prepare(self, step, commits, log):
+        if self.args.agent != "auto" or step == "verify":
+            return
+        previous = next((c for c in commits if c["trailers"].get("Harness-Step") == "implement"), None)
+        fixed = previous["trailers"]["Harness-Agent"] if previous else None
+        if step == "review":
+            fixed = OTHER_AGENT[fixed]
+        previous_phase = next((c for c in commits if c["trailers"].get("Harness-Step") == step), None)
+        self.raised = bool(previous_phase and (
+            previous_phase["trailers"].get("Harness-Raised") == "true" or
+            unresolved(message_body(previous_phase["message"]))))
+        task_text = section_body(self.spec, "목표") or self.spec
+        task_text += "\n" + (section_body(self.spec, "동작 명세") or "")
+        prior_review = next((c for c in commits if c["trailers"].get("Harness-Step") == "review"), None)
+        reviewer_raised = bool(prior_review and (prior_review["trailers"].get("Harness-Raised") == "true"
+                                                 or unresolved(message_body(prior_review["message"]))))
+        self.choice = selection.select(step, task_text, self.worktree, self.args.timeout,
+                                       agent_runtime, log, fixed, self.raised, reviewer_raised)
+        if step == "implement":
+            self.agent = self.choice.agent
+
     def new_log(self, step):
         log = self.state / "logs" / self.id / f"{step}-{uuid4().hex}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -1168,9 +1326,12 @@ class Task:
             f"{guide}"
             f"Task specification\n{self.spec}"
         )
-        if last and last["trailers"].get("Harness-Step") == "review":
+        if last and last["trailers"].get("Harness-Step") in ("review", "verify"):
             if findings := message_body(last["message"]):
-                prompt += f"\n\nPrevious review findings\n{findings}\n\n{IMPLEMENT_SCOPE}"
+                kind = last["trailers"]["Harness-Step"]
+                prompt += f"\n\nPrevious {kind} findings\n{findings}"
+                if kind == "review":
+                    prompt += f"\n\n{IMPLEMENT_SCOPE}"
         if conflicts:
             prompt += (
                 "\n\nMerge conflicts with main\nThe harness merged origin/main into this branch and committed "
@@ -1178,13 +1339,26 @@ class Task:
                 + "\n".join(f"- {name}" for name in conflicts)
                 + "\n\nRemove every conflict marker (`<<<<<<<`, `=======`, `>>>>>>>`) and preserve the intent "
                 "of both sides. Do not revert the changes that came from main.")
-        final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
+        choice = self.choice
+        if choice:
+            prompt += EVIDENCE_PROMPT
+            try:
+                final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout, choice)
+            except QuotaReached:
+                if git(self.worktree, "status", "--porcelain"):
+                    git(self.worktree, "add", "-A")
+                    git(self.worktree, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv",
+                        "--output", str(log.with_suffix(".patch").resolve()), "HEAD", "--")
+                    git(self.worktree, "restore", "--source=HEAD", "--staged", "--worktree", "--", ".")
+                raise
+        else:
+            final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
         git(self.worktree, "add", "-A")
         message = build_message(
             f"harness({self.id}): implement round {round_number}",
             final_message(final, log) or NO_FINAL_MESSAGE,
             [("Harness-Task", self.id), ("Harness-Step", "implement"), ("Harness-Agent", self.agent),
-             ("Harness-Round", round_number)])
+             ("Harness-Round", round_number), *self.settings()])
         return harness_commit(self.worktree, message)
 
     def review(self, log, last=None):
@@ -1197,7 +1371,11 @@ class Task:
         # An adopted round (Harness-Agent: human) is reviewed by the counterpart of the CLI agent.
         implementer = (last["trailers"].get("Harness-Agent") if last else None)
         reviewer = OTHER_AGENT[implementer if implementer in OTHER_AGENT else self.agent]
-        final = run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout)
+        if self.choice:
+            prompt = EVIDENCE_PROMPT + "\n" + prompt
+            final = run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout, self.choice)
+        else:
+            final = run_agent(reviewer, "review", prompt, self.worktree, log, self.args.timeout)
         ensure_clean(self.worktree)
         if git(self.worktree, "rev-parse", "HEAD") != commit:
             raise ValueError("리뷰하는 동안 작업 커밋이 바뀌었습니다.")
@@ -1207,7 +1385,7 @@ class Task:
             f"harness({self.id}): review {verdict}", output,
             [("Harness-Task", self.id), ("Harness-Step", "review"), ("Harness-Agent", reviewer),
              ("Harness-Reviewed", commit), ("Harness-Verdict", verdict),
-             ("Harness-Blocking", "?" if blocking is None else blocking)])
+             ("Harness-Blocking", "?" if blocking is None else blocking), *self.settings()])
         return harness_commit(self.worktree, message), verdict
 
     def rework_context(self):
@@ -1263,6 +1441,8 @@ class Task:
             f"harness({self.id}): verify {result}", output,
             [("Harness-Task", self.id), ("Harness-Step", "verify"), ("Harness-Verified", reviewed),
              ("Harness-Result", result), ("Harness-Command", self.command_text)])
+        if self.args.agent == "auto":
+            verification_metrics(commits, log, result)
         return harness_commit(self.worktree, message), result
 
     def finish(self, commits):
@@ -1334,6 +1514,10 @@ def run_task(args, cwd):
                     if git(worktree, "rev-parse", "HEAD") != head:
                         commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
+                if (args.agent == "auto" and step == "verify" and last
+                        and last["trailers"].get("Harness-Result") == "fail"
+                        and any(unresolved(message_body(c["message"])) for c in commits[:3])):
+                    step, round_number = "implement", round_number + 1
                 syncs = conflict_syncs(commits)
                 conflicts = list(syncs)
                 if step == "review" and conflicts and files_with_markers(worktree, syncs):
@@ -1354,6 +1538,7 @@ def run_task(args, cwd):
                 if pending_push(worktree, args.id):
                     push_branch(worktree, args.id)
                 log = task.new_log(step)
+                task.prepare(step, commits, log)
                 set_lock_step(lock, step)
                 if step == "implement":
                     sha, result = task.implement(round_number, last, log, conflicts), None
@@ -1555,7 +1740,11 @@ def generate_spec(root, state, args, request):
     log.touch()
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        final = run_agent(args.agent, "spec", prompt, root, log, args.timeout)
+        if args.agent == "auto":
+            choice = selection.select("spec", args.request, root, args.timeout, agent_runtime, log)
+            final = run_agent(choice.agent, "spec", prompt, root, log, args.timeout, choice)
+        else:
+            final = run_agent(args.agent, "spec", prompt, root, log, args.timeout)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ValueError(f"{exc} (log: {log})") from exc
     # The agent runs read-only; this check is a second line of defence.
@@ -1580,7 +1769,7 @@ def generate_spec(root, state, args, request):
     print("가정과 열린 질문을 확인하고 명세를 고친 뒤, 열린 질문이 없으면 명세 PR을 올리세요:\n"
           f"  python -m harness.orchestrator propose {args.id}\n"
           "사람이 명세 PR(spec/<작업 ID>)을 머지하면 승인입니다. 그 뒤:\n"
-          f"  python -m harness.orchestrator run {args.id} <claude|codex>")
+          f"  python -m harness.orchestrator run {args.id} <claude|codex|auto>")
     return spec
 
 
@@ -1645,7 +1834,7 @@ def parse_args(argv):
                                    help="Do not post the open questions as an issue comment.")
     subparsers.choices["spec"].add_argument("request", help="Feature request to turn into a task specification.")
     for name in ("spec", "run"):
-        subparsers.choices[name].add_argument("agent", choices=OTHER_AGENT)
+        subparsers.choices[name].add_argument("agent", choices=(*OTHER_AGENT, "auto"))
     subparsers.choices["run"].add_argument("--max-rounds", type=int, default=3,
                                            help="Maximum implement runs before asking a human.")
     subparsers.choices["run"].add_argument("--wait", type=float, default=0, metavar="SECONDS",
