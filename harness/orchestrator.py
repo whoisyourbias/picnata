@@ -43,7 +43,20 @@ Classify every finding by severity:
   - Rare edge cases the specification does not require, such as concurrent runs or timing races.
   - Extra defensive code, refactoring, naming, documentation wording, style.
   - Improvements outside the specification's scope.
+  - A scenario that can only be reproduced if the worker deliberately tampers with configuration, logs, \
+or another session's files, or if two processes pass the same point at the same moment, unless the \
+specification's completion criteria name that scenario directly.
 If you are unsure, classify the finding as Follow-up. Only Blocking findings require changes.
+
+Rework rounds: when the input has a `Previous blocking findings` section, this is a rework round and \
+only these findings are Blocking:
+  - A previous Blocking finding is still not resolved.
+  - A change shown under `Changes since the previous review` introduces a new regression or \
+specification violation.
+  - An item listed in the specification's completion criteria is not met.
+Every other finding is a Follow-up. A new problem found in code that no earlier round flagged and that \
+is not part of `Changes since the previous review` is also a Follow-up. This restriction does not \
+apply to the first review round.
 
 Output format: write two sections, `## Blocking` and `## Follow-ups`. If a section has no findings, \
 its body is `None`. The last two lines of your output must be exactly:
@@ -92,6 +105,12 @@ def parse_verdict(text):
 
 def review_follow_ups(text):
     """The body of the '## Follow-ups' section of a review, or '' when it is absent or None."""
+    return review_section(text, "follow-ups")
+
+
+def review_section(text, title):
+    """The body of the review section whose heading is title (case-insensitive), or '' when it is
+    absent or None."""
     collected, level, fence = [], None, None
     for line in text.replace("\r", "").splitlines():
         stripped = line.strip()
@@ -123,7 +142,7 @@ def review_follow_ups(text):
             if level is not None and depth <= level:
                 break
             if level is None:
-                if (heading.group(2) or "").lower() == "follow-ups":
+                if (heading.group(2) or "").lower() == title.lower():
                     level = depth
                 continue
         if level is not None:
@@ -972,6 +991,7 @@ class Task:
         commit = git(self.worktree, "rev-parse", "HEAD")
         diff = git(self.worktree, "diff", "--no-ext-diff", "--no-textconv", "origin/main...HEAD", "--")
         prompt = f"{REVIEW_INSTRUCTIONS}\n\nTask specification\n{self.spec}\n\nCommit {commit}\n\n{diff}"
+        prompt += self.rework_context()
         # The reviewer is the counterpart of whoever implemented the commit, not of the current CLI agent.
         # An adopted round (Harness-Agent: human) is reviewed by the counterpart of the CLI agent.
         implementer = (last["trailers"].get("Harness-Agent") if last else None)
@@ -988,6 +1008,21 @@ class Task:
              ("Harness-Reviewed", commit), ("Harness-Verdict", verdict),
              ("Harness-Blocking", "?" if blocking is None else blocking)])
         return harness_commit(self.worktree, message), verdict
+
+    def rework_context(self):
+        """The extra review input of a rework round: the previous review's Blocking section and the
+        diff since the commit it reviewed. Empty on the first review round."""
+        previous = next((c for c in read_commits(self.worktree)
+                         if c["trailers"].get("Harness-Step") == "review"), None)
+        if previous is None:
+            return ""
+        findings = review_section(message_body(previous["message"]), "blocking") or "None"
+        reviewed = previous["trailers"].get("Harness-Reviewed")
+        changes = "Not available; review the full diff above."
+        if reviewed and git_ok(self.worktree, "merge-base", "--is-ancestor", reviewed, "HEAD"):
+            changes = git(self.worktree, "diff", "--no-ext-diff", "--no-textconv", reviewed, "HEAD", "--")
+        return (f"\n\nPrevious blocking findings\n{findings}"
+                f"\n\nChanges since the previous review\n{changes}")
 
     def verify(self, commits, log):
         ensure_clean(self.worktree)
