@@ -1205,7 +1205,6 @@ def trees_equal(worktree, first, second):
     return git(worktree, "rev-parse", f"{first}^{{tree}}") == git(worktree, "rev-parse", f"{second}^{{tree}}")
 
 
-<<<<<<< HEAD
 EVIDENCE_PROMPT = ("\nIf analysis at this setting could not resolve a review or verification issue, "
                    "include a line 'UNRESOLVED: <issue>' and 'EVIDENCE: <failed analysis>'. "
                    "Use these lines only for unresolved code issues.")
@@ -1218,7 +1217,8 @@ def unresolved(message):
         return False
     external = r"rate.limit|usage.limit|quota|authenticat|credentials|environment|환경 오류|구독 한도|인증 오류"
     return not re.search(external, issue[1] + " " + evidence[1], re.I)
-=======
+
+
 def adopt_human_commits(worktree, task_id, commits, spec_path):
     """Record the trailerless commits after the last harness commit as a new implement round by
     Harness-Agent: human, so review and verify run on them next. commits is newest first.
@@ -1271,7 +1271,6 @@ def adopt_human_commits(worktree, task_id, commits, spec_path):
         # Every adopted commit keeps its line: the list is the record a person checks in the PR.
         clip_body=False)
     return harness_commit(worktree, message), adopted, round_number
->>>>>>> origin/main
 
 
 class Task:
@@ -1329,8 +1328,17 @@ class Task:
         )
         if last and last["trailers"].get("Harness-Step") in ("review", "verify"):
             if findings := message_body(last["message"]):
-<<<<<<< HEAD
-                prompt += f"\n\nPrevious {last['trailers']['Harness-Step']} findings\n{findings}"
+                kind = last["trailers"]["Harness-Step"]
+                prompt += f"\n\nPrevious {kind} findings\n{findings}"
+                if kind == "review":
+                    prompt += f"\n\n{IMPLEMENT_SCOPE}"
+        if conflicts:
+            prompt += (
+                "\n\nMerge conflicts with main\nThe harness merged origin/main into this branch and committed "
+                "the result with conflict markers. Conflicted files:\n"
+                + "\n".join(f"- {name}" for name in conflicts)
+                + "\n\nRemove every conflict marker (`<<<<<<<`, `=======`, `>>>>>>>`) and preserve the intent "
+                "of both sides. Do not revert the changes that came from main.")
         choice = self.choice
         if choice:
             prompt += EVIDENCE_PROMPT
@@ -1345,17 +1353,6 @@ class Task:
                 raise
         else:
             final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
-=======
-                prompt += f"\n\nPrevious review findings\n{findings}\n\n{IMPLEMENT_SCOPE}"
-        if conflicts:
-            prompt += (
-                "\n\nMerge conflicts with main\nThe harness merged origin/main into this branch and committed "
-                "the result with conflict markers. Conflicted files:\n"
-                + "\n".join(f"- {name}" for name in conflicts)
-                + "\n\nRemove every conflict marker (`<<<<<<<`, `=======`, `>>>>>>>`) and preserve the intent "
-                "of both sides. Do not revert the changes that came from main.")
-        final = run_agent(self.agent, "implement", prompt, self.worktree, log, self.args.timeout)
->>>>>>> origin/main
         git(self.worktree, "add", "-A")
         message = build_message(
             f"harness({self.id}): implement round {round_number}",
@@ -1387,12 +1384,8 @@ class Task:
         message = build_message(
             f"harness({self.id}): review {verdict}", output,
             [("Harness-Task", self.id), ("Harness-Step", "review"), ("Harness-Agent", reviewer),
-<<<<<<< HEAD
-             ("Harness-Reviewed", commit), ("Harness-Verdict", verdict), *self.settings()])
-=======
              ("Harness-Reviewed", commit), ("Harness-Verdict", verdict),
-             ("Harness-Blocking", "?" if blocking is None else blocking)])
->>>>>>> origin/main
+             ("Harness-Blocking", "?" if blocking is None else blocking), *self.settings()])
         return harness_commit(self.worktree, message), verdict
 
     def rework_context(self):
@@ -1521,17 +1514,15 @@ def run_task(args, cwd):
                     if git(worktree, "rev-parse", "HEAD") != head:
                         commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
-<<<<<<< HEAD
                 if (args.agent == "auto" and step == "verify" and last
                         and last["trailers"].get("Harness-Result") == "fail"
                         and any(unresolved(message_body(c["message"])) for c in commits[:3])):
-=======
+                    step, round_number = "implement", round_number + 1
                 syncs = conflict_syncs(commits)
                 conflicts = list(syncs)
                 if step == "review" and conflicts and files_with_markers(worktree, syncs):
                     # Unresolved markers (left by a resolution round, or hidden under a later clean
                     # sync) are never reviewed; resolve again.
->>>>>>> origin/main
                     step, round_number = "implement", round_number + 1
                 if step == "done":
                     print(f"{args.id}: verified; 구현 PR 머지는 사람이 결정합니다.")
@@ -1778,10 +1769,7 @@ def generate_spec(root, state, args, request):
     print("가정과 열린 질문을 확인하고 명세를 고친 뒤, 열린 질문이 없으면 명세 PR을 올리세요:\n"
           f"  python -m harness.orchestrator propose {args.id}\n"
           "사람이 명세 PR(spec/<작업 ID>)을 머지하면 승인입니다. 그 뒤:\n"
-<<<<<<< HEAD
           f"  python -m harness.orchestrator run {args.id} <claude|codex|auto>")
-=======
-          f"  python -m harness.orchestrator run {args.id} <claude|codex>")
     return spec
 
 
@@ -1821,7 +1809,6 @@ def from_issue(args, cwd):
     except ValueError as exc:
         raise ValueError(f"명세는 {task_path}에 썼지만 이슈 코멘트를 남기지 못했습니다: {exc}") from exc
     print(f"이슈 #{number}에 코멘트를 남겼습니다:\n{comment}")
->>>>>>> origin/main
     return 0
 
 
