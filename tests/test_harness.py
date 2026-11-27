@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1398,14 +1399,10 @@ class SyncPlanTests(unittest.TestCase):
         self.assertEqual([], orchestrator.conflict_files(
             [fake_commit("review")] + commits))
 
-    def test_setext_underline_is_not_a_conflict_marker(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "resolved.md").write_text("Title\n=======\n\ntext\n", encoding="utf-8")
-            (root / "open.md").write_text("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> main\n", encoding="utf-8")
-            (root / "half.md").write_text("a\n>>>>>>> origin/main\n", encoding="utf-8")
-            self.assertEqual(["open.md", "half.md"],
-                             orchestrator.files_with_markers(root, ["resolved.md", "open.md", "half.md"]))
+    def test_conflict_syncs_names_both_parents_of_each_sync(self):
+        sync = {"sha": "s" * 40, "message": "", "trailers": {"Harness-Step": "sync", "Harness-Conflict": "a.txt"}}
+        self.assertEqual({"a.txt": [("s" * 40 + "^1", "s" * 40 + "^2")]},
+                         orchestrator.conflict_syncs([sync, fake_commit("implement")]))
 
 
 class LockRetryTests(unittest.TestCase):
@@ -1498,16 +1495,33 @@ class ClaimTests(GitFlowTestCase):
         base = self.spec_agent()
 
         def run(agent, phase, prompt, cwd, log, timeout):
-            # Another session's from-issue 6 logs its spec run under .harness and then writes its draft.
-            logs = self.state / "logs" / "issue-6"
-            logs.mkdir(parents=True, exist_ok=True)
-            (logs / "spec-x.log").touch()
-            other.write_text("# 다른 세션\n", encoding="utf-8")
+            # Another session's from-issue 6 records its draft under .harness and then writes it.
+            orchestrator.write_spec_draft(self.state, "issue-6", other, "# 다른 세션\n")
             return base(agent, phase, prompt, cwd, log, timeout)
 
         with patch.object(orchestrator, "run_agent", side_effect=run):
             self.assertEqual(0, self.cli("from-issue", "5", "codex"), self.stderr)
         self.assertEqual(SPEC, self.issue_spec.read_text(encoding="utf-8"))
+
+    def test_stale_logs_do_not_excuse_another_task_file(self):
+        self.issue()
+        other = self.root / "docs" / "tasks" / "issue-6.md"
+        # An earlier spec run for issue-6 left its log and draft record; its draft is gone since.
+        logs = self.state / "logs" / "issue-6"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "spec-old.log").touch()
+        orchestrator.write_spec_draft(self.state, "issue-6", other, "# 예전 초안\n")
+        other.unlink()
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            other.write_text("# 끼어든 명세\n", encoding="utf-8")
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(1, self.cli("from-issue", "5", "codex"))
+        self.assertIn("changed files during the read-only spec step", self.stderr)
+        self.assertFalse(self.issue_spec.exists())
 
     def test_without_gh_exits_with_1(self):
         with patch.object(orchestrator, "gh_available", return_value=None):
@@ -1602,6 +1616,37 @@ class ClaimTests(GitFlowTestCase):
         self.assertIn("spec/demo가 이미 있습니다", self.stderr)
         self.assertEqual("other session", run_git(self.origin, "log", "-1", "--format=%s", "spec/demo"))
 
+    def test_identical_concurrent_proposal_loses_the_race(self):
+        """Same spec, same second: the other session's proposal must not make ours look up to date."""
+        real_git = orchestrator.git
+        pushed = []
+
+        built = {}
+
+        def other_session_proposes_the_same(cwd, *args, **kwargs):
+            if args and args[0] == "push" and not pushed:
+                # The other session builds its commit as propose does, from the same tree, parent and
+                # second; only its own claim token differs.
+                pushed.append(True)
+                message = re.sub(r"Harness-Claim: \w+", f"Harness-Claim: {uuid.uuid4().hex}", built["message"])
+                other = real_git(cwd, *orchestrator.AUTHOR, *built["args"], "-F", "-", input=message)
+                run_git(self.root, "push", "origin", f"{other}:refs/heads/spec/demo")
+                built["other"] = other
+            result = real_git(cwd, *args, **kwargs)
+            if "commit-tree" in args:
+                index = args.index("commit-tree")
+                built.update(args=args[index:index + 4], message=kwargs["input"], ours=result)
+            return result
+
+        with patch.object(orchestrator, "git", side_effect=other_session_proposes_the_same), \
+                patch.dict(os.environ, {"GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+                                        "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z"}):
+            self.assertEqual(4, self.cli("propose", "demo"))
+        self.assertIn("spec/demo가 이미 있습니다", self.stderr)
+        self.assertIn("Harness-Claim: ", built["message"])
+        self.assertNotEqual(built["ours"], built["other"])
+        self.assertEqual(built["other"], run_git(self.origin, "rev-parse", "spec/demo"))
+
     def test_issue_links_in_pull_request_bodies(self):
         for task in ("issue-7", "demo"):
             path = self.root / "docs" / "tasks" / f"{task}.md"
@@ -1642,17 +1687,20 @@ class SyncTests(GitFlowTestCase):
             self.assertEqual(1, self.run_cli())
         self.calls.clear()
 
-    def conflicted_run(self, resolve=True, verdicts=("APPROVE",), *extra):
-        """main added result.txt differently from the branch; the implementer then resolves (or not)."""
+    def conflicted_run(self, resolve=True, verdicts=("APPROVE",), *extra, main_text="from main\n"):
+        """main added result.txt differently from the branch; the implementer then resolves (or not).
+
+        resolve may also be the text the implementer leaves in result.txt."""
         self.interrupt()
-        self.advance_main("result.txt", "from main\n")
+        self.advance_main("result.txt", main_text)
         base = self.agent(verdicts)
 
         def run(agent, phase, prompt, cwd, log, timeout):
             if phase == "implement" and "Merge conflicts with main" in prompt:
                 self.calls.append((agent, phase, prompt))
                 if resolve:
-                    (Path(cwd) / "result.txt").write_text("resolved\n", encoding="utf-8")
+                    text = resolve if isinstance(resolve, str) else "resolved\n"
+                    (Path(cwd) / "result.txt").write_text(text, encoding="utf-8")
                 final = log.with_name(log.stem + "-final.md")
                 final.write_text("충돌을 다뤘습니다.", encoding="utf-8")
                 return final
@@ -1728,6 +1776,24 @@ class SyncTests(GitFlowTestCase):
         self.assertEqual("implement", self.calls[0][1])
         self.assertEqual(["1", "2", "3"], [c["trailers"]["Harness-Round"] for c in self.branch_commits()
                                            if c["trailers"]["Harness-Step"] == "implement"])
+        self.assertEqual(("verify", "pass"), self.steps()[-1])
+
+    def test_leftover_separator_stops_before_review(self):
+        self.assertEqual(1, self.conflicted_run("from main\n=======\nmine\n"))
+        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
+        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+
+    def test_custom_conflict_marker_size_is_detected(self):
+        self.advance_main(".gitattributes", "result.txt conflict-marker-size=10\n")
+        self.assertEqual(1, self.conflicted_run(resolve=False))
+        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
+        sync = self.branch_commits()[1]
+        self.assertIn("<" * 10, run_git(self.worktree, "show", f"{sync['sha']}:result.txt"))
+        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+
+    def test_heading_underline_from_main_is_not_a_marker(self):
+        self.assertEqual(0, self.conflicted_run("Title\n=======\nresolved\n",
+                                                main_text="Title\n=======\nfrom main\n"), self.stderr)
         self.assertEqual(("verify", "pass"), self.steps()[-1])
 
     def test_sync_is_not_counted_but_conflict_resolution_is(self):

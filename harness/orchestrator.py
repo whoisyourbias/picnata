@@ -1,6 +1,7 @@
 """Local Claude Code and Codex collaboration whose state lives in git and pull requests."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -67,9 +68,6 @@ class Claimed(ValueError):
 ISSUE_TASK = re.compile(r"issue-([1-9][0-9]*)")
 LOCK_RETRIES = 3
 LOCK_RETRY_DELAY = 2
-# Only the opening and closing markers count: a bare ======= line is also a valid Markdown
-# Setext heading underline, and git never writes it without the surrounding <<<<<<< and >>>>>>>.
-CONFLICT_OPEN = re.compile(r"^(<{7}|>{7})(?: |$)", re.MULTILINE)
 COMMENT_HEADER = "하네스 명세 초안의 열린 질문입니다. 답을 이 이슈에 남기거나 세션에서 알려 주세요."
 
 BLOCKING_LINE = re.compile(r"BLOCKING: (\d+)")
@@ -473,34 +471,61 @@ def split_paths(value, worktree=None):
     return names
 
 
-def conflict_files(commits, worktree=None):
-    """Files of conflicted syncs that no review or verify has followed yet, else [].
+def conflict_syncs(commits, worktree=None):
+    """{file: [(ours, theirs), ...]} for the conflicted syncs that no review or verify has followed yet.
 
     commits is newest first; implement commits and clean syncs between are skipped, so a clean
-    sync cannot hide an earlier conflict that is still unresolved."""
-    files = []
+    sync cannot hide an earlier conflict that is still unresolved. ours and theirs are the two
+    parents of the sync merge that named the file."""
+    found = {}
     for commit in commits:
         trailers = commit["trailers"]
         step = trailers.get("Harness-Step")
         if step == "implement" or (step == "sync" and not trailers.get("Harness-Conflict")):
             continue
         if step == "sync":
-            files += [name for name in split_paths(trailers["Harness-Conflict"], worktree) if name not in files]
+            for name in split_paths(trailers["Harness-Conflict"], worktree):
+                found.setdefault(name, []).append((f"{commit['sha']}^1", f"{commit['sha']}^2"))
             continue
         break
-    return files
+    return found
 
 
-def files_with_markers(worktree, files):
-    """The files among the given paths that still hold conflict markers."""
+def conflict_files(commits, worktree=None):
+    """Files of conflicted syncs that no review or verify has followed yet, else []."""
+    return list(conflict_syncs(commits, worktree))
+
+
+LEFTOVER_MARKER = re.compile(r":(\d+): leftover conflict marker\s*$")
+
+
+def marker_lines(worktree, base, name):
+    """Worktree line numbers of name that git reports as conflict markers added relative to base.
+
+    git decides what a marker is: <<<<<<<, =======, >>>>>>> and ||||||| lines of the file's
+    conflict-marker-size (from .gitattributes, default 7)."""
+    result = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-color", "--check", base, "--", name],
+        cwd=worktree, capture_output=True, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if result.returncode > 3:
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(message or "git diff --check failed")
+    return {int(match.group(1)) for line in result.stdout.decode("utf-8", errors="replace").splitlines()
+            if (match := LEFTOVER_MARKER.search(line))}
+
+
+def files_with_markers(worktree, syncs):
+    """The conflicted files (conflict_syncs) that still hold conflict markers.
+
+    A marker line counts only when it is new relative to both sides of a sync that named the file,
+    so a ======= line (a Markdown heading underline, say) that either side already had is content."""
     found = []
-    for name in files:
-        path = Path(worktree) / name
-        try:
-            if path.is_file() and CONFLICT_OPEN.search(path.read_text(encoding="utf-8", errors="replace")):
-                found.append(name)
-        except OSError:
+    for name, bases in syncs.items():
+        if not (Path(worktree) / name).is_file():
             continue
+        if any(marker_lines(worktree, ours, name) & marker_lines(worktree, theirs, name)
+               for ours, theirs in bases):
+            found.append(name)
     return found
 
 
@@ -802,12 +827,16 @@ def propose(args, cwd):
         git(main_root, "read-tree", "origin/main", env=env)
         git(main_root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{task_path}", env=env)
         tree = git(main_root, "write-tree", env=env)
-    message = build_message(f"spec({args.id}): {title}", "", [("Harness-Task", args.id)])
+    # Harness-Claim makes every proposal a distinct commit: two sessions proposing the same spec in the
+    # same second would otherwise build the same commit, and git reports the second push "up to date"
+    # instead of rejecting it, so both would believe they claimed the task.
+    message = build_message(f"spec({args.id}): {title}", "",
+                            [("Harness-Task", args.id), ("Harness-Claim", uuid4().hex)])
     commit = git(main_root, *AUTHOR, "commit-tree", tree, "-p", "origin/main", "-F", "-", input=message)
-    # A new branch is pushed without force, so of two sessions pushing at once git rejects one of them.
-    push = ["push", "origin", f"{commit}:refs/heads/{branch}"]
-    if remote_sha:
-        push.insert(1, f"--force-with-lease=refs/heads/{branch}:{remote_sha}")
+    # A new branch must still be absent on origin (empty lease), so of two sessions pushing at once
+    # git rejects one of them; --update replaces only the branch this session looked up.
+    push = ["push", f"--force-with-lease=refs/heads/{branch}:{remote_sha or ''}",
+            "origin", f"{commit}:refs/heads/{branch}"]
     try:
         git(main_root, *push, timeout=300)
     except ValueError as exc:
@@ -1238,8 +1267,9 @@ def run_task(args, cwd):
                     if git(worktree, "rev-parse", "HEAD") != head:
                         commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
-                conflicts = conflict_files(commits, worktree)
-                if step == "review" and conflicts and files_with_markers(worktree, conflicts):
+                syncs = conflict_syncs(commits, worktree)
+                conflicts = list(syncs)
+                if step == "review" and conflicts and files_with_markers(worktree, syncs):
                     # Unresolved markers (left by a resolution round, or hidden under a later clean
                     # sync) are never reviewed; resolve again.
                     step, round_number = "implement", round_number + 1
@@ -1269,7 +1299,7 @@ def run_task(args, cwd):
                     sha, result = task.verify(commits, log)
                 print(f"{args.id}: {step}{' ' + result if result else ''} {sha[:12]}; log: {log}")
                 push_branch(worktree, args.id)
-                if step == "implement" and conflicts and (left := files_with_markers(worktree, conflicts)):
+                if step == "implement" and conflicts and (left := files_with_markers(worktree, syncs)):
                     raise ValueError(f"충돌 표시가 남아 있습니다: {', '.join(left)}")
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 if log is not None:
@@ -1345,6 +1375,21 @@ def write_spec(args, cwd):
     return 0
 
 
+def draft_record(state, task_id):
+    """Where the harness records the SHA-256 of the spec draft it writes for task_id."""
+    return state / "logs" / task_id / "spec-draft.sha256"
+
+
+def write_spec_draft(state, task_id, target, spec):
+    """Write the draft (text mode line endings, as before) after recording its exact bytes' hash,
+    so a concurrent spec run of another task sees the record before the file appears."""
+    data = spec.replace("\n", os.linesep).encode("utf-8")
+    record = draft_record(state, task_id)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(hashlib.sha256(data).hexdigest() + "\n", encoding="ascii")
+    target.write_bytes(data)
+
+
 def generate_spec(root, state, args, request):
     """Run the read-only spec agent for args.id and write docs/tasks/<id>.md under root; returns the spec."""
     task_path = f"docs/tasks/{args.id}.md"
@@ -1356,21 +1401,34 @@ def generate_spec(root, state, args, request):
 
     def snapshot():
         # Harness logs live under .harness/; it is gitignored in this repository but may not be elsewhere.
-        # Other sessions may add their own new specs to this shared checkout meanwhile; such a draft is
-        # tolerated only when its own spec run left a log under .harness (agents cannot write there).
-        status = [line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
-                  if not line[3:].startswith(".harness/") and not other_session_spec(line)]
+        status = {line for line in git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
+                  if not line[3:].startswith(".harness/")}
         return status, git(root, "diff", "--no-ext-diff", "--no-textconv")
 
-    def other_session_spec(line):
+    def other_task(line):
         name = line[3:]
         if not (line.startswith("?? docs/tasks/") and name.endswith(".md")) or name == task_path:
-            return False
+            return None
         other = name[len("docs/tasks/"):-len(".md")]
-        if "/" in other or other == args.id:
+        return None if "/" in other or other == args.id else other
+
+    def other_session_draft(line):
+        # Other sessions may add their own new specs to this shared checkout meanwhile. A new draft is
+        # tolerated only when the harness recorded exactly these bytes under .harness before writing
+        # them (agents cannot write there); an old log or record does not vouch for other content.
+        other = other_task(line)
+        record = draft_record(state, other) if other else None
+        try:
+            return bool(record) and record.read_text(encoding="ascii").strip() == \
+                hashlib.sha256((root / line[3:]).read_bytes()).hexdigest()
+        except OSError:
             return False
-        logs = state / "logs" / other
-        return logs.is_dir() and any(logs.glob("spec-*.log"))
+
+    def other_session_removal(line):
+        # propose deletes its pushed local copy; only a draft some spec run produced may disappear.
+        other = other_task(line)
+        logs = state / "logs" / other if other else None
+        return bool(logs) and logs.is_dir() and any(logs.glob("spec-*.log"))
 
     before = snapshot()
     log = state / "logs" / args.id / f"spec-{uuid4().hex}.log"
@@ -1382,14 +1440,17 @@ def generate_spec(root, state, args, request):
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ValueError(f"{exc} (log: {log})") from exc
     # The agent runs read-only; this check is a second line of defence.
-    if snapshot() != before or target.exists():
+    after = snapshot()
+    added = [line for line in after[0] - before[0] if not other_session_draft(line)]
+    removed = [line for line in before[0] - after[0] if not other_session_removal(line)]
+    if added or removed or after[1] != before[1] or target.exists():
         raise ValueError("The agent changed files during the read-only spec step; review with git status "
                          "and git diff before continuing.")
     output = Path(final).read_text(encoding="utf-8", errors="replace") if final and Path(final).is_file() else ""
     spec = extract_spec(output)
     if spec is None:
         raise ValueError(f"The agent did not output a specification starting with a '# ' heading. Log: {log}")
-    target.write_text(spec, encoding="utf-8")
+    write_spec_draft(state, args.id, target, spec)
     print(f"{args.id}: specification written to {task_path}; log: {log}")
     if summary := spec_sections(spec, "가정", "열린 질문"):
         print(summary)
