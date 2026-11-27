@@ -1399,6 +1399,22 @@ class SyncPlanTests(unittest.TestCase):
         self.assertEqual([], orchestrator.conflict_files(
             [fake_commit("review")] + commits))
 
+    def test_conflict_paths_with_commas_are_quoted(self):
+        names = ["a.txt", "a,b.txt", 'q"uote.txt', "back\\slash", " lead", "new\nline", "b.txt"]
+        joined = orchestrator.join_paths(names)
+        self.assertEqual(names, orchestrator.split_paths(joined))
+        self.assertEqual("a.txt,b.txt", orchestrator.join_paths(["a.txt", "b.txt"]))
+        self.assertNotIn("\n", joined)
+
+    def test_plain_comma_list_never_merges_into_an_existing_path(self):
+        # Even with an unrelated file named "a.txt,b.txt", the trailer names two conflicted files.
+        commits = [fake_commit("sync", **{"Harness-Conflict": "a.txt,b.txt"}), fake_commit("implement")]
+        with tempfile.TemporaryDirectory() as scratch:
+            (Path(scratch) / "a.txt,b.txt").write_text("x", encoding="utf-8")
+            self.assertEqual(["a.txt", "b.txt"], orchestrator.conflict_files(commits))
+        self.assertEqual(["a.txt,b.txt"], orchestrator.conflict_files(
+            [fake_commit("sync", **{"Harness-Conflict": '"a.txt,b.txt"'}), fake_commit("implement")]))
+
     def test_conflict_syncs_names_both_parents_of_each_sync(self):
         sync = {"sha": "s" * 40, "message": "", "trailers": {"Harness-Step": "sync", "Harness-Conflict": "a.txt"}}
         self.assertEqual({"a.txt": [("s" * 40, "s" * 40 + "^1", "s" * 40 + "^2")]},
@@ -1553,6 +1569,25 @@ class ClaimTests(GitFlowTestCase):
         self.assertEqual("# 먼저 쓴 세션\n", self.issue_spec.read_text(encoding="utf-8"))
         self.assertFalse((self.gh_state / "comment.md").exists())
 
+    def test_old_draft_record_does_not_excuse_identical_bytes(self):
+        self.issue()
+        other = self.root / "docs" / "tasks" / "issue-6.md"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        # An earlier from-issue 6 wrote this draft; propose then removed the local copy.
+        orchestrator.write_spec_draft(self.state, "issue-6", other, "# 예전 초안\n")
+        data = other.read_bytes()
+        other.unlink()
+        base = self.spec_agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            other.write_bytes(data)  # the agent recreates the same bytes
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(1, self.cli("from-issue", "5", "codex"))
+        self.assertIn("changed files during the read-only spec step", self.stderr)
+        self.assertFalse(self.issue_spec.exists())
+
     def test_agent_deleting_another_draft_is_rejected_despite_old_logs(self):
         self.issue()
         other = self.root / "docs" / "tasks" / "issue-6.md"
@@ -1653,6 +1688,14 @@ class ClaimTests(GitFlowTestCase):
         self.assertEqual(4, self.cli("propose", "demo"))
         self.assertIn("spec/demo가 이미 있습니다. 다른 세션이 집은 작업이면 건드리지 마세요. "
                       "내가 올린 명세를 고치는 것이면 --update로 다시 실행하세요.", self.stderr)
+        self.assertEqual(before, run_git(self.origin, "rev-parse", "spec/demo"))
+
+    def test_repeated_propose_without_local_draft_reports_the_claim(self):
+        self.assertEqual(0, self.cli("propose", "demo"), self.stderr)
+        self.assertFalse(self.spec_path.exists())  # propose removed its pushed local copy
+        before = run_git(self.origin, "rev-parse", "spec/demo")
+        self.assertEqual(4, self.cli("propose", "demo"))
+        self.assertIn("spec/demo가 이미 있습니다.", self.stderr)
         self.assertEqual(before, run_git(self.origin, "rev-parse", "spec/demo"))
 
     def test_propose_update_replaces_the_branch(self):
@@ -1874,6 +1917,14 @@ class SyncTests(GitFlowTestCase):
             self.assertEqual(1, self.run_cli())
         self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
         self.assertIn("<<<<<<<", (self.worktree / "result.txt").read_text(encoding="utf-8"))
+        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+
+    def test_leftover_separator_next_to_a_heading_underline_stops_before_review(self):
+        # main's Markdown heading underline is a legitimate ======= line; the conflict separator left
+        # in the paragraph below it is one copy more than the merge can hold.
+        self.assertEqual(1, self.conflicted_run("Title\n=======\nfrom main\n=======\nround 1\n",
+                                                main_text="Title\n=======\nfrom main\n"))
+        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
         self.assertNotIn("review", [phase for _, phase, _ in self.calls])
 
     def test_heading_underline_from_main_is_not_a_marker(self):

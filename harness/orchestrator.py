@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -456,22 +457,48 @@ def plan_next(commits):
     raise ValueError(f"알 수 없는 Harness-Step: {step}")
 
 
-def split_paths(value, worktree=None):
-    """Split a comma-joined path list; commas inside a path are kept when that path exists in worktree."""
-    parts = value.split(",")
-    if worktree is None:
-        return [part for part in parts if part]
-    names, index = [], 0
-    while index < len(parts):
-        end = next((stop for stop in range(len(parts), index, -1)
-                    if (Path(worktree) / ",".join(parts[index:stop])).exists()), index + 1)
-        if name := ",".join(parts[index:end]):
+PATH_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+PATH_UNESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
+
+
+def quote_path(name):
+    """A path as written into a comma-joined trailer: plain, or double-quoted with backslash escapes
+    when it holds a comma, quote, backslash, control character or surrounding blanks."""
+    if name == name.strip() and not any(char in name for char in ',"' + "".join(PATH_ESCAPES)):
+        return name
+    return '"' + "".join(PATH_ESCAPES.get(char, char) for char in name) + '"'
+
+
+def join_paths(names):
+    return ",".join(quote_path(name) for name in names)
+
+
+def split_paths(value):
+    """Split a path list written by join_paths; a comma inside a quoted path does not split it."""
+    names, index, size = [], 0, len(value)
+    while index < size:
+        if value[index] == '"':
+            chars, index = [], index + 1
+            while index < size and value[index] != '"':
+                if value[index] == "\\" and index + 1 < size:
+                    index += 1
+                    chars.append(PATH_UNESCAPES.get(value[index], value[index]))
+                else:
+                    chars.append(value[index])
+                index += 1
+            name = "".join(chars)
+            index = value.find(",", index)
+            index = size if index < 0 else index + 1
+        else:
+            end = value.find(",", index)
+            end = size if end < 0 else end
+            name, index = value[index:end], end + 1
+        if name:
             names.append(name)
-        index = end
     return names
 
 
-def conflict_syncs(commits, worktree=None):
+def conflict_syncs(commits):
     """{file: [(sync, ours, theirs), ...]} for the conflicted syncs that no review or verify has followed yet.
 
     commits is newest first; implement commits and clean syncs between are skipped, so a clean
@@ -485,16 +512,16 @@ def conflict_syncs(commits, worktree=None):
             continue
         if step == "sync":
             sha = commit["sha"]
-            for name in split_paths(trailers["Harness-Conflict"], worktree):
+            for name in split_paths(trailers["Harness-Conflict"]):
                 found.setdefault(name, []).append((sha, f"{sha}^1", f"{sha}^2"))
             continue
         break
     return found
 
 
-def conflict_files(commits, worktree=None):
+def conflict_files(commits):
     """Files of conflicted syncs that no review or verify has followed yet, else []."""
-    return list(conflict_syncs(commits, worktree))
+    return list(conflict_syncs(commits))
 
 
 MARKER_LINE = re.compile(r"^(?:(<+|>+|\|+)(?: .*)?|(=+))$")
@@ -511,26 +538,54 @@ def blob_lines(worktree, revision, name):
     return text_lines(result.stdout) if result.returncode == 0 else []
 
 
-def marker_sizes(merged, ours, theirs):
+def marker_size(line):
+    """The marker length of a line shaped like a conflict marker, else None."""
+    if match := MARKER_LINE.match(line):
+        return len(match.group(1) or match.group(2))
+    return None
+
+
+def excess_markers(lines, ours, theirs, base):
+    """Marker-shaped lines of lines beyond what the merged content can hold: {line: extra count}.
+
+    A merge may keep a line as often as either parent has it, or as often as both sides' additions
+    to the merge base together; every further copy was written by the merge. Counting copies
+    instead of asking whether the text occurs at all keeps a leftover ======= separator visible
+    when the file also has a legitimate ======= line (a Markdown heading underline, say)."""
+    counts = Counter(line for line in lines if marker_size(line) is not None)
+    ours, theirs, base = Counter(ours), Counter(theirs), Counter(base)
+    excess = {}
+    for line, count in counts.items():
+        allowed = max(ours[line], theirs[line], ours[line] + theirs[line] - base[line])
+        if count > allowed:
+            excess[line] = count - allowed
+    return excess
+
+
+def marker_sizes(merged, ours, theirs, base):
     """The conflict marker sizes git wrote into a sync merge: an opening and a closing marker of the
-    same length that neither parent had. Read from the sync commit itself, so attributes changed
+    same length beyond what the parents had. Read from the sync commit itself, so attributes changed
     later (conflict-marker-size in .gitattributes, say) cannot hide the markers it holds."""
-    known = set(ours) | set(theirs)
     opening, closing = set(), set()
-    for line in merged:
-        if line in known or not (match := MARKER_LINE.match(line)) or not match.group(1):
-            continue
-        run = match.group(1)
-        (opening if run[0] == "<" else closing if run[0] == ">" else set()).add(len(run))
+    for line in excess_markers(merged, ours, theirs, base):
+        run = MARKER_LINE.match(line).group(1)
+        if run:
+            (opening if run[0] == "<" else closing if run[0] == ">" else set()).add(len(run))
     return opening & closing
+
+
+def merge_base(worktree, ours, theirs):
+    try:
+        return git(worktree, "merge-base", ours, theirs)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
 
 
 def files_with_markers(worktree, syncs):
     """The conflicted files (conflict_syncs) that still hold conflict markers.
 
-    A marker line counts only when it has a size git used in a sync that named the file and is new
-    relative to both of that sync's parents, so a ======= line (a Markdown heading underline, say)
-    that either side already had is content."""
+    A marker line counts only when it has a size git used in a sync that named the file and the file
+    holds more copies of it than the merge of that sync's parents can account for (excess_markers)."""
     found = []
     for name, syncs_of_file in syncs.items():
         path = Path(worktree) / name
@@ -539,10 +594,11 @@ def files_with_markers(worktree, syncs):
         current = text_lines(path.read_bytes())
         for sync, ours, theirs in syncs_of_file:
             ours_lines, theirs_lines = blob_lines(worktree, ours, name), blob_lines(worktree, theirs, name)
-            sizes = marker_sizes(blob_lines(worktree, sync, name), ours_lines, theirs_lines)
-            known = set(ours_lines) | set(theirs_lines)
-            if any(line not in known and (match := MARKER_LINE.match(line))
-                   and len(match.group(1) or match.group(2)) in sizes for line in current):
+            base = merge_base(worktree, ours, theirs)
+            base_lines = blob_lines(worktree, base, name) if base else []
+            sizes = marker_sizes(blob_lines(worktree, sync, name), ours_lines, theirs_lines, base_lines)
+            if any(marker_size(line) in sizes
+                   for line in excess_markers(current, ours_lines, theirs_lines, base_lines)):
                 found.append(name)
                 break
     return found
@@ -573,7 +629,9 @@ def sync_main(worktree, task_id):
         git(worktree, *AUTHOR, "merge", "--no-commit", "--no-ff", "origin/main")
         conflicts = []
     except ValueError as exc:
-        conflicts = git(worktree, "-c", "core.quotepath=false", "diff", "--name-only", "--diff-filter=U").splitlines()
+        # -z gives the names verbatim (no C-style quoting); join_paths quotes the ones that need it.
+        conflicts = [name for name in git(worktree, "diff", "--name-only", "-z", "--diff-filter=U").split("\0")
+                     if name]
         if not conflicts:
             git_ok(worktree, "merge", "--abort")
             raise ValueError(f"main 병합에 실패했습니다: {exc}") from exc
@@ -581,7 +639,7 @@ def sync_main(worktree, task_id):
     trailers = [("Harness-Task", task_id), ("Harness-Step", "sync"), ("Harness-Merged", merged)]
     body = f"main {merged[:12]}까지 병합했습니다."
     if conflicts:
-        trailers.append(("Harness-Conflict", ",".join(conflicts)))
+        trailers.append(("Harness-Conflict", join_paths(conflicts)))
         body += f"\n충돌 파일: {', '.join(conflicts)}"
     harness_commit(worktree, build_message(f"harness({task_id}): sync with main", body, trailers))
     print(f"{task_id}: merged origin/main {merged[:12]}" + (f"; 충돌: {', '.join(conflicts)}" if conflicts else ""))
@@ -822,6 +880,16 @@ def propose(args, cwd):
     main_root = state.parent
     task_path = f"docs/tasks/{args.id}.md"
     target = main_root / task_path
+    branch = f"spec/{args.id}"
+    claimed = (f"{branch}가 이미 있습니다. 다른 세션이 집은 작업이면 건드리지 마세요. "
+               "내가 올린 명세를 고치는 것이면 --update로 다시 실행하세요.")
+    # The claim is checked before the local draft: once proposed, the draft is gone locally, and a
+    # repeated propose must still report the claimed branch rather than a missing file.
+    fetch(main_root)
+    remote_head = git(main_root, "ls-remote", "--heads", "origin", branch, timeout=300).split()
+    remote_sha = remote_head[0] if remote_head else None
+    if remote_sha and not args.update:
+        raise Claimed(claimed)
     if not target.is_file():
         raise ValueError(f"명세가 없습니다: {task_path}")
     spec = target.read_text(encoding="utf-8-sig")
@@ -829,17 +897,9 @@ def propose(args, cwd):
         raise ValueError(f"명세가 비어 있습니다: {task_path}")
     if section_body(spec, "열린 질문") != "없음":
         raise ValueError("열린 질문이 남아 있습니다. 사용자와 정리한 뒤 다시 propose 하세요.")
-    fetch(main_root)
     if git_ok(main_root, "cat-file", "-e", f"origin/main:{task_path}"):
         raise ValueError(f"origin/main에 {task_path}가 이미 있습니다 (이미 승인됨).")
     title = spec_title(spec, args.id)
-    branch = f"spec/{args.id}"
-    claimed = (f"{branch}가 이미 있습니다. 다른 세션이 집은 작업이면 건드리지 마세요. "
-               "내가 올린 명세를 고치는 것이면 --update로 다시 실행하세요.")
-    remote_head = git(main_root, "ls-remote", "--heads", "origin", branch, timeout=300).split()
-    remote_sha = remote_head[0] if remote_head else None
-    if remote_sha and not args.update:
-        raise Claimed(claimed)
     with tempfile.TemporaryDirectory() as scratch:
         env = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}
         blob = git(main_root, "hash-object", "-w", "--", str(target))
@@ -1292,7 +1352,7 @@ def run_task(args, cwd):
                     if git(worktree, "rev-parse", "HEAD") != head:
                         commits = read_commits(worktree, merged_task=args.id)
                 step, round_number, last = plan_next(commits)
-                syncs = conflict_syncs(commits, worktree)
+                syncs = conflict_syncs(commits)
                 conflicts = list(syncs)
                 if step == "review" and conflicts and files_with_markers(worktree, syncs):
                     # Unresolved markers (left by a resolution round, or hidden under a later clean
@@ -1429,13 +1489,25 @@ def write_spec_draft(state, task_id, target, spec):
     The file is created exclusively: when another session wrote the same draft first, its file is
     kept and Claimed is raised."""
     data = spec.replace("\n", os.linesep).encode("utf-8")
-    record_draft(state, task_id, "written", data)
+    record = record_draft(state, task_id, "written", data)
     try:
         with open(target, "xb") as handle:
             handle.write(data)
     except FileExistsError as exc:
+        record.unlink(missing_ok=True)
         raise Claimed(f"{target}가 그사이에 생겼습니다. 같은 PC의 다른 세션이 먼저 쓴 명세이므로 "
                       "남겨 둡니다.") from exc
+    except BaseException:
+        record.unlink(missing_ok=True)
+        raise
+    # Renaming the finished record gives it a name no spec run that was already running has seen,
+    # so such a run accepts this draft even when its write began before the run listed the records.
+    record.rename(record.with_name(record.name + ".done"))
+
+
+def written_records(state):
+    """Every "written" draft record of every task, to tell records made during a spec run from older ones."""
+    return set((state / "logs").glob("*/spec-drafts-written/*"))
 
 
 def generate_spec(root, state, args, request):
@@ -1461,10 +1533,11 @@ def generate_spec(root, state, args, request):
         return None if "/" in other or other == args.id else other
 
     def written_by_harness(task, name):
-        # A draft is the harness's only when it recorded exactly these bytes under .harness before
-        # writing them (agents cannot write there); an old log or record does not vouch for other content.
+        # A draft is the harness's only when another session recorded exactly these bytes under
+        # .harness during this run (agents cannot write there). A record that existed before the run
+        # started belongs to an earlier draft, so it does not vouch for a file that appears now.
         try:
-            return bool(recorded(state, task, "written", (root / name).read_bytes()))
+            return bool(recorded(state, task, "written", (root / name).read_bytes()) - records_before)
         except OSError:
             return False
 
@@ -1492,6 +1565,7 @@ def generate_spec(root, state, args, request):
         return any(record.stat().st_mtime >= started - 60 for record in recorded(state, other, "removed", data))
 
     started = time.time()
+    records_before = written_records(state)  # listed before the status snapshot; see write_spec_draft
     before = snapshot()
     drafts = drafts_of_other_tasks(before[0])
     log = state / "logs" / args.id / f"spec-{uuid4().hex}.log"
