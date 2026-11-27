@@ -574,6 +574,32 @@ def marker_sizes(merged, ours, theirs, base):
     return opening & closing
 
 
+def leftover_markers(current, merged, ours, theirs, base):
+    """Whether current (the file now) still holds conflict marker lines that the sync merge wrote.
+
+    merged is the file as the sync merge committed it (markers included). It holds every line either
+    side brought, and a line both sides added identically only once, so the legitimate copies of a
+    marker-shaped line are its copies in merged minus the markers git wrote there: per conflict hunk
+    one opening, one separator and one closing line (and a base marker in diff3 style). Taking one
+    side wholesale is also allowed. Lines of a size git did not use in the merge are not markers."""
+    sizes = marker_sizes(merged, ours, theirs, base)
+    if not sizes:
+        return False
+    written, hunks = Counter(), Counter()
+    for line, extra in excess_markers(merged, ours, theirs, base).items():
+        run = MARKER_LINE.match(line).group(1)
+        if run and len(run) in sizes:
+            written[line] += extra
+            if run[0] == "<":
+                hunks[len(run)] += extra
+    for size, count in hunks.items():
+        written["=" * size] += count
+    merged, ours, theirs = Counter(merged), Counter(ours), Counter(theirs)
+    counts = Counter(line for line in current if marker_size(line) in sizes)
+    return any(count > max(ours[line], theirs[line], merged[line] - written[line])
+               for line, count in counts.items())
+
+
 def merge_base(worktree, ours, theirs):
     try:
         return git(worktree, "merge-base", ours, theirs)
@@ -585,7 +611,7 @@ def files_with_markers(worktree, syncs):
     """The conflicted files (conflict_syncs) that still hold conflict markers.
 
     A marker line counts only when it has a size git used in a sync that named the file and the file
-    holds more copies of it than the merge of that sync's parents can account for (excess_markers)."""
+    holds more copies of it than that sync's merge can account for (leftover_markers)."""
     found = []
     for name, syncs_of_file in syncs.items():
         path = Path(worktree) / name
@@ -596,9 +622,7 @@ def files_with_markers(worktree, syncs):
             ours_lines, theirs_lines = blob_lines(worktree, ours, name), blob_lines(worktree, theirs, name)
             base = merge_base(worktree, ours, theirs)
             base_lines = blob_lines(worktree, base, name) if base else []
-            sizes = marker_sizes(blob_lines(worktree, sync, name), ours_lines, theirs_lines, base_lines)
-            if any(marker_size(line) in sizes
-                   for line in excess_markers(current, ours_lines, theirs_lines, base_lines)):
+            if leftover_markers(current, blob_lines(worktree, sync, name), ours_lines, theirs_lines, base_lines):
                 found.append(name)
                 break
     return found

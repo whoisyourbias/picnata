@@ -1932,6 +1932,50 @@ class SyncTests(GitFlowTestCase):
                                                 main_text="Title\n=======\nfrom main\n"), self.stderr)
         self.assertEqual(("verify", "pass"), self.steps()[-1])
 
+    def test_leftover_separator_below_an_underline_both_sides_added_stops_before_review(self):
+        # Both sides add the same Title/======= heading, which the merge keeps once; the separator
+        # left between the two paragraphs is then one ======= line more than the merge holds.
+        self.merge_spec()
+        base = self.agent(crash_review=True)
+
+        def first(agent, phase, prompt, cwd, log, timeout):
+            final = base(agent, phase, prompt, cwd, log, timeout)
+            if phase == "implement":
+                (Path(cwd) / "result.txt").write_text("Title\n=======\nfrom branch\n", encoding="utf-8")
+            return final
+
+        with patch.object(orchestrator, "run_agent", side_effect=first):
+            self.assertEqual(1, self.run_cli())
+        self.calls.clear()
+        self.advance_main("result.txt", "Title\n=======\nfrom main\n")
+        base = self.agent()
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            if phase == "implement" and "Merge conflicts with main" in prompt:
+                self.calls.append((agent, phase, prompt))
+                (Path(cwd) / "result.txt").write_text("Title\n=======\nfrom branch\n=======\nfrom main\n",
+                                                      encoding="utf-8")
+                final = log.with_name(log.stem + "-final.md")
+                final.write_text("충돌을 다뤘습니다.", encoding="utf-8")
+                return final
+            return base(agent, phase, prompt, cwd, log, timeout)
+
+        with patch.object(orchestrator, "run_agent", side_effect=run):
+            self.assertEqual(1, self.run_cli())
+        sync = next(c for c in self.branch_commits() if c["trailers"]["Harness-Step"] == "sync")
+        self.assertEqual("result.txt", sync["trailers"]["Harness-Conflict"])
+        self.assertEqual(2, run_git(self.worktree, "show", f"{sync['sha']}:result.txt").splitlines().count("======="))
+        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
+        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+
+    def test_leftover_markers_counts_against_the_sync_merge(self):
+        merged = ["Title", "=======", "<<<<<<< HEAD", "A", "=======", "B", ">>>>>>> origin/main"]
+        ours, theirs, base = ["Title", "=======", "A"], ["Title", "=======", "B"], ["x"]
+        self.assertTrue(orchestrator.leftover_markers(["Title", "=======", "A", "=======", "B"],
+                                                      merged, ours, theirs, base))
+        self.assertFalse(orchestrator.leftover_markers(["Title", "=======", "A", "B"], merged, ours, theirs, base))
+        self.assertFalse(orchestrator.leftover_markers(ours, merged, ours, theirs, base))
+
     def test_sync_is_not_counted_but_conflict_resolution_is(self):
         self.interrupt()
         self.advance_main("other.txt", "x\n")
