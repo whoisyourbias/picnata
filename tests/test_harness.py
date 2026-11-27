@@ -1885,8 +1885,16 @@ class SyncTests(GitFlowTestCase):
                                            if c["trailers"]["Harness-Step"] == "implement"])
         self.assertEqual(("verify", "pass"), self.steps()[-1])
 
-    def test_leftover_separator_stops_before_review(self):
-        self.assertEqual(1, self.conflicted_run("from main\n=======\nmine\n"))
+    def test_separator_alone_is_not_an_unresolved_marker(self):
+        # The spec's rule looks only at <<<<<<< and >>>>>>> lines: a ======= left in a plain-text
+        # file cannot be told apart from a heading underline, so the review catches it, not the harness.
+        self.assertEqual(0, self.conflicted_run("Combined A\n=======\nB\n"), self.stderr)
+        self.assertNotIn("충돌 표시가 남아 있습니다", self.stderr)
+        self.assertIn("review", [phase for _, phase, _ in self.calls])
+        self.assertEqual(("verify", "pass"), self.steps()[-1])
+
+    def test_leftover_closing_marker_alone_stops_before_review(self):
+        self.assertEqual(1, self.conflicted_run("resolved\n>>>>>>> origin/main\n"))
         self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
         self.assertNotIn("review", [phase for _, phase, _ in self.calls])
 
@@ -1919,22 +1927,20 @@ class SyncTests(GitFlowTestCase):
         self.assertIn("<<<<<<<", (self.worktree / "result.txt").read_text(encoding="utf-8"))
         self.assertNotIn("review", [phase for _, phase, _ in self.calls])
 
-    def test_leftover_separator_next_to_a_heading_underline_stops_before_review(self):
-        # main's Markdown heading underline is a legitimate ======= line; the conflict separator left
-        # in the paragraph below it is one copy more than the merge can hold.
-        self.assertEqual(1, self.conflicted_run("Title\n=======\nfrom main\n=======\nround 1\n",
-                                                main_text="Title\n=======\nfrom main\n"))
-        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
-        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+    def test_separator_next_to_a_heading_underline_reaches_review(self):
+        # Only ======= lines remain (a heading underline and a separator): not unresolved by the rule.
+        self.assertEqual(0, self.conflicted_run("Title\n=======\nfrom main\n=======\nround 1\n",
+                                                main_text="Title\n=======\nfrom main\n"), self.stderr)
+        self.assertIn("review", [phase for _, phase, _ in self.calls])
 
     def test_heading_underline_from_main_is_not_a_marker(self):
         self.assertEqual(0, self.conflicted_run("Title\n=======\nresolved\n",
                                                 main_text="Title\n=======\nfrom main\n"), self.stderr)
         self.assertEqual(("verify", "pass"), self.steps()[-1])
 
-    def test_leftover_separator_below_an_underline_both_sides_added_stops_before_review(self):
-        # Both sides add the same Title/======= heading, which the merge keeps once; the separator
-        # left between the two paragraphs is then one ======= line more than the merge holds.
+    def test_separator_below_an_underline_both_sides_added_reaches_review(self):
+        # Both sides add the same Title/======= heading, which the merge keeps once; a separator
+        # left between the two paragraphs is only a ======= line, which the rule does not judge.
         self.merge_spec()
         base = self.agent(crash_review=True)
 
@@ -1961,29 +1967,20 @@ class SyncTests(GitFlowTestCase):
             return base(agent, phase, prompt, cwd, log, timeout)
 
         with patch.object(orchestrator, "run_agent", side_effect=run):
-            self.assertEqual(1, self.run_cli())
+            self.assertEqual(0, self.run_cli(), self.stderr)
         sync = next(c for c in self.branch_commits() if c["trailers"]["Harness-Step"] == "sync")
         self.assertEqual("result.txt", sync["trailers"]["Harness-Conflict"])
-        self.assertEqual(2, run_git(self.worktree, "show", f"{sync['sha']}:result.txt").splitlines().count("======="))
-        self.assertIn("충돌 표시가 남아 있습니다: result.txt", self.stderr)
-        self.assertNotIn("review", [phase for _, phase, _ in self.calls])
+        self.assertNotIn("충돌 표시가 남아 있습니다", self.stderr)
+        self.assertIn("review", [phase for _, phase, _ in self.calls])
 
-    def test_leftover_markers_counts_against_the_sync_merge(self):
-        merged = ["Title", "=======", "<<<<<<< HEAD", "A", "=======", "B", ">>>>>>> origin/main"]
-        ours, theirs, base = ["Title", "=======", "A"], ["Title", "=======", "B"], ["x"]
-        self.assertTrue(orchestrator.leftover_markers(["Title", "=======", "A", "=======", "B"],
-                                                      merged, ours, theirs, base))
-        self.assertFalse(orchestrator.leftover_markers(["Title", "=======", "A", "B"], merged, ours, theirs, base))
-        self.assertFalse(orchestrator.leftover_markers(ours, merged, ours, theirs, base))
-        # A heading the resolution adds brings its own underline; it is not a leftover separator.
-        self.assertFalse(orchestrator.leftover_markers(
-            ["Title", "=======", "A", "B", "", "Summary", "=======", "C"], merged, ours, theirs, base))
-        # A separator left in place is still found next to the new heading.
-        self.assertTrue(orchestrator.leftover_markers(
-            ["Title", "=======", "A", "=======", "B", "", "Summary", "=======", "C"], merged, ours, theirs, base))
-        # A separator below a blank line underlines nothing.
-        self.assertTrue(orchestrator.leftover_markers(
-            ["Title", "=======", "A", "", "=======", "B"], merged, ours, theirs, base))
+    def test_unresolved_markers_rule(self):
+        unresolved = orchestrator.unresolved_markers
+        self.assertTrue(unresolved(["A", "<<<<<<< HEAD", "B"]))
+        self.assertTrue(unresolved([">>>>>>> origin/main"]))
+        self.assertTrue(unresolved(["<<<<<<<<<< HEAD"]))  # a longer marker starts with seven
+        self.assertFalse(unresolved(["Title", "=======", "A", "=======", "B"]))
+        self.assertFalse(unresolved(["<<<<<< six", " <<<<<<< indented", "x >>>>>>> y"]))
+        self.assertFalse(unresolved([]))
 
     def test_new_heading_underline_after_combining_both_sides_reaches_review(self):
         # Both sides add the same Title heading; the implementer combines the paragraphs, removes

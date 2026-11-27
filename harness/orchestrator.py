@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -524,122 +523,28 @@ def conflict_files(commits):
     return list(conflict_syncs(commits))
 
 
-MARKER_LINE = re.compile(r"^(?:(<+|>+|\|+)(?: .*)?|(=+))$")
+MARKER_PREFIXES = ("<" * 7, ">" * 7)
 
 
-def text_lines(data):
-    return [line.rstrip("\r") for line in data.decode("utf-8", errors="replace").split("\n")]
+def unresolved_markers(lines):
+    """Whether lines still hold an unresolved conflict: a line starting with <<<<<<< or >>>>>>>.
+
+    The marker length is fixed at git's default 7 (longer runs start with it too), and
+    conflict-marker-size in .gitattributes is not read. ======= cannot be told apart from a
+    Markdown heading underline, so it is not part of the rule; a resolution that leaves only a
+    separator is left to verify (code) or review (documents)."""
+    return any(line.startswith(MARKER_PREFIXES) for line in lines)
 
 
-def blob_lines(worktree, revision, name):
-    """Lines of name at revision, or [] when the file does not exist there."""
-    result = subprocess.run(["git", "cat-file", "blob", f"{revision}:{name}"], cwd=worktree,
-                            capture_output=True, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-    return text_lines(result.stdout) if result.returncode == 0 else []
-
-
-def marker_size(line):
-    """The marker length of a line shaped like a conflict marker, else None."""
-    if match := MARKER_LINE.match(line):
-        return len(match.group(1) or match.group(2))
-    return None
-
-
-def excess_markers(lines, ours, theirs, base):
-    """Marker-shaped lines of lines beyond what the merged content can hold: {line: extra count}.
-
-    A merge may keep a line as often as either parent has it, or as often as both sides' additions
-    to the merge base together; every further copy was written by the merge. Counting copies
-    instead of asking whether the text occurs at all keeps a leftover ======= separator visible
-    when the file also has a legitimate ======= line (a Markdown heading underline, say)."""
-    counts = Counter(line for line in lines if marker_size(line) is not None)
-    ours, theirs, base = Counter(ours), Counter(theirs), Counter(base)
-    excess = {}
-    for line, count in counts.items():
-        allowed = max(ours[line], theirs[line], ours[line] + theirs[line] - base[line])
-        if count > allowed:
-            excess[line] = count - allowed
-    return excess
-
-
-def marker_sizes(merged, ours, theirs, base):
-    """The conflict marker sizes git wrote into a sync merge: an opening and a closing marker of the
-    same length beyond what the parents had. Read from the sync commit itself, so attributes changed
-    later (conflict-marker-size in .gitattributes, say) cannot hide the markers it holds."""
-    opening, closing = set(), set()
-    for line in excess_markers(merged, ours, theirs, base):
-        run = MARKER_LINE.match(line).group(1)
-        if run:
-            (opening if run[0] == "<" else closing if run[0] == ">" else set()).add(len(run))
-    return opening & closing
-
-
-def new_heading_underline(lines, index, merged_lines):
-    """Whether lines[index] is a ======= line that underlines a heading the resolution wrote.
-
-    A leftover separator sits next to lines the sync merge brought (the hunk's content), so a
-    separator-shaped line right below a non-blank text line that the merge did not have is a new
-    Markdown heading underline, not a marker."""
-    if not MARKER_LINE.match(lines[index]).group(2) or index == 0:
-        return False
-    above = lines[index - 1]
-    return bool(above.strip()) and marker_size(above) is None and above not in merged_lines
-
-
-def leftover_markers(current, merged, ours, theirs, base):
-    """Whether current (the file now) still holds conflict marker lines that the sync merge wrote.
-
-    merged is the file as the sync merge committed it (markers included). It holds every line either
-    side brought, and a line both sides added identically only once, so the legitimate copies of a
-    marker-shaped line are its copies in merged minus the markers git wrote there: per conflict hunk
-    one opening, one separator and one closing line (and a base marker in diff3 style). Taking one
-    side wholesale is also allowed. Lines of a size git did not use in the merge are not markers,
-    and neither is the underline of a heading the resolution wrote (new_heading_underline)."""
-    sizes = marker_sizes(merged, ours, theirs, base)
-    if not sizes:
-        return False
-    written, hunks = Counter(), Counter()
-    for line, extra in excess_markers(merged, ours, theirs, base).items():
-        run = MARKER_LINE.match(line).group(1)
-        if run and len(run) in sizes:
-            written[line] += extra
-            if run[0] == "<":
-                hunks[len(run)] += extra
-    for size, count in hunks.items():
-        written["=" * size] += count
-    merged_lines = set(merged)
-    merged, ours, theirs = Counter(merged), Counter(ours), Counter(theirs)
-    counts = Counter(line for index, line in enumerate(current)
-                     if marker_size(line) in sizes and not new_heading_underline(current, index, merged_lines))
-    return any(count > max(ours[line], theirs[line], merged[line] - written[line])
-               for line, count in counts.items())
-
-
-def merge_base(worktree, ours, theirs):
-    try:
-        return git(worktree, "merge-base", ours, theirs)
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return None
-
-
-def files_with_markers(worktree, syncs):
-    """The conflicted files (conflict_syncs) that still hold conflict markers.
-
-    A marker line counts only when it has a size git used in a sync that named the file and the file
-    holds more copies of it than that sync's merge can account for (leftover_markers)."""
+def files_with_markers(worktree, names):
+    """The conflicted files (conflict_files) that still hold unresolved conflict markers."""
     found = []
-    for name, syncs_of_file in syncs.items():
+    for name in names:
         path = Path(worktree) / name
-        if not path.is_file():
-            continue
-        current = text_lines(path.read_bytes())
-        for sync, ours, theirs in syncs_of_file:
-            ours_lines, theirs_lines = blob_lines(worktree, ours, name), blob_lines(worktree, theirs, name)
-            base = merge_base(worktree, ours, theirs)
-            base_lines = blob_lines(worktree, base, name) if base else []
-            if leftover_markers(current, blob_lines(worktree, sync, name), ours_lines, theirs_lines, base_lines):
+        if path.is_file():
+            text = path.read_bytes().decode("utf-8", errors="replace")
+            if unresolved_markers(line.rstrip("\r") for line in text.split("\n")):
                 found.append(name)
-                break
     return found
 
 
