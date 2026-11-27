@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -279,6 +280,17 @@ class PromptTests(unittest.TestCase):
                        "BLOCKING: <number of blocking findings>\nVERDICT: <APPROVE|REQUEST_CHANGES>",
                        "reproduction scenario", "bypasses or weakens", "breaks existing tests",
                        "concurrent runs or timing races"):
+            self.assertIn(phrase, text)
+
+    def test_review_prompt_states_rework_round_rules(self):
+        text = " ".join(orchestrator.REVIEW_INSTRUCTIONS.split())
+        for phrase in ("`Previous blocking findings`", "A previous Blocking finding is still not resolved",
+                       "`Changes since the previous review` introduces a new regression",
+                       "specification's completion criteria is not met",
+                       "that no earlier round flagged", "does not apply to the first review round",
+                       "deliberately tampers with configuration, logs, or another session's files",
+                       "two processes pass the same point at the same moment",
+                       "unless the specification's completion criteria name that scenario directly"):
             self.assertIn(phrase, text)
 
 
@@ -831,6 +843,100 @@ class RunTests(GitFlowTestCase):
             self.assertEqual(0, self.run_cli(), self.stderr)
         body = (self.gh_state / "body.md").read_text(encoding="utf-8")
         self.assertIn(f"## 후속 과제 (리뷰)\n\n{follow_ups}", body)
+
+    def rework_agent(self, reviews):
+        """A fake agent whose implement round n writes only round<n>.txt, so each round's diff is distinct."""
+        reviews, rounds = iter(reviews), []
+
+        def run(agent, phase, prompt, cwd, log, timeout):
+            self.calls.append((agent, phase, prompt))
+            if phase == "implement":
+                rounds.append(None)
+                (Path(cwd) / "result.txt").write_text("ok", encoding="utf-8")
+                (Path(cwd) / f"round{len(rounds)}.txt").write_text(f"line of round {len(rounds)}\n",
+                                                                     encoding="utf-8")
+                final = log.with_name(log.stem + "-final.md")
+                final.write_text("done", encoding="utf-8")
+                return final
+            log.write_text(next(reviews), encoding="utf-8")
+        return run
+
+    def review_prompts(self):
+        return [prompt for _, phase, prompt in self.calls if phase == "review"]
+
+    def test_first_review_round_has_no_rework_sections(self):
+        self.merge_spec()
+        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent(
+                ["## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE\n"])):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        [prompt] = self.review_prompts()
+        # The instructions name the sections; the input after them must not contain them.
+        self.assertTrue(prompt.startswith(orchestrator.REVIEW_INSTRUCTIONS))
+        given = prompt[len(orchestrator.REVIEW_INSTRUCTIONS):]
+        self.assertIn("+line of round 1", given)
+        self.assertNotIn("Previous blocking findings", given)
+        self.assertNotIn("Changes since the previous review", given)
+
+    def test_rework_round_gets_previous_blocking_and_incremental_diff(self):
+        self.merge_spec()
+        blocking = "- `round1.txt:1` is wrong.\n  Reproduce: open it."
+        first = (f"## Blocking\n{blocking}\n\n## Follow-ups\n- rename later\n\n"
+                 "BLOCKING: 1\nVERDICT: REQUEST_CHANGES\n")
+        second = "## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent([first, second])):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        _, prompt = self.review_prompts()
+        full, _, rework = prompt.partition("\n\nPrevious blocking findings\n")
+        findings, _, changes = rework.partition("\n\nChanges since the previous review\n")
+        self.assertEqual(blocking, findings)
+        self.assertNotIn("rename later", findings)
+        # The full diff still shows both rounds; the incremental diff only the second.
+        self.assertIn("+line of round 1", full)
+        self.assertIn("+line of round 2", full)
+        self.assertIn("+line of round 2", changes)
+        self.assertNotIn("round 1", changes)
+        self.assertNotIn("round1.txt", changes)
+
+    def test_rework_round_after_approve_lists_no_previous_blocking(self):
+        self.merge_spec()
+        approve = "## Blocking\nNone\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        # An approval whose Blocking section still holds a stale draft finding.
+        stale = "## Blocking\n- stale draft finding\n\n## Follow-ups\nNone\n\nBLOCKING: 0\nVERDICT: APPROVE\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent([stale])):
+            self.assertEqual(0, self.run_cli(), self.stderr)
+        # A human change after the approved review is adopted and reviewed again.
+        (self.worktree / "human.txt").write_text("human line\n", encoding="utf-8")
+        run_git(self.worktree, "add", "-A")
+        run_git(self.worktree, *IDENT, "commit", "-m", "human fix")
+        self.calls.clear()
+        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent([approve])):
+            self.assertEqual(0, self.run_cli("--adopt"), self.stderr)
+        [prompt] = self.review_prompts()
+        self.assertIn("\n\nPrevious blocking findings\nNone\n\nChanges since the previous review\n", prompt)
+        changes = prompt.partition("Changes since the previous review\n")[2]
+        self.assertIn("+human line", changes)
+        self.assertNotIn("round 1", changes)
+        self.assertNotIn("stale draft finding", prompt[len(orchestrator.REVIEW_INSTRUCTIONS):])
+
+    def test_rework_round_without_reviewed_commit_in_history(self):
+        self.merge_spec()
+        request = "## Blocking\n- broken\n\n## Follow-ups\nNone\n\nBLOCKING: 1\nVERDICT: REQUEST_CHANGES\n"
+        with patch.object(orchestrator, "run_agent", side_effect=self.rework_agent([request])):
+            self.assertEqual(1, self.run_cli("--max-rounds", "1"))
+        # Point the review at a commit that is not in the branch history, then add an implement round.
+        review = orchestrator.read_commits(self.worktree)[0]
+        missing = "0" * 40
+        message = review["message"].replace(review["trailers"]["Harness-Reviewed"], missing)
+        run_git(self.worktree, *orchestrator.AUTHOR, "commit", "--amend", "--allow-empty", "-m", message)
+        orchestrator.harness_commit(self.worktree, orchestrator.build_message(
+            "harness(demo): implement round 2", "done",
+            [("Harness-Task", "demo"), ("Harness-Step", "implement"), ("Harness-Agent", "codex"),
+             ("Harness-Round", 2)]))
+        args = argparse.Namespace(id="demo", agent="codex", timeout=60)
+        task = orchestrator.Task(args, self.root, self.state, self.worktree, self.spec_path, SPEC, "", [])
+        context = task.rework_context()
+        self.assertIn("Previous blocking findings\n- broken", context)
+        self.assertIn("Changes since the previous review\nNot available; review the full diff above.", context)
 
     def test_missing_blocking_line_records_question_mark(self):
         self.merge_spec()
