@@ -360,6 +360,22 @@ python -m harness.orchestrator status add-tests
   이어받은 라운드가 있으면 `adopted: <첫 SHA>..<마지막 SHA> (round <n>)` 줄을 더한다. 마지막 하네스 커밋 뒤에 트레일러 없는 커밋이 있으면
   오류로 멈추지 않고 다음 단계를 `blocked (...)`로 표시하며, 이전 이어받기 줄과 나머지 정보도 그대로 보여 준다.
 
+### 여러 세션의 병렬 작업
+
+한 PC에서 여러 Claude 세션이 이슈의 서로 다른 작업을 동시에 `이슈 → 명세 PR → 구현 PR`까지 처리할 수 있다. 어떤 이슈를 누가 집을지는 세션(사람)이 정한다. 하네스는 상주하지 않고 작업을 자동 분배하지 않는다. 의존 작업(머지 안 된 다른 작업을 전제하는 작업)은 그 작업이 머지된 뒤에 시작하고, 여러 PC·클론의 동시 작업은 범위 밖이다(락 파일은 한 PC의 같은 저장소 안에서만 서로 보인다).
+
+- `from-issue <번호> <claude|codex> [--no-comment]`: `gh issue view`로 이슈를 읽어 작업 ID `issue-<번호>`의 명세 초안을 `docs/tasks/issue-<번호>.md`에 쓴다(`spec`과 같은 읽기 전용 에이전트, 이슈 본문은 데이터로만 취급). 이슈가 없거나 닫혀 있으면 종료 코드 1이다.
+  쓰기 전에 선점을 검사한다. 로컬 `docs/tasks/issue-<번호>.md`가 있거나(같은 PC의 다른 세션), `origin`에 `spec/issue-<번호>`·`harness/issue-<번호>`가 있거나, `origin/main`에 그 명세가 있으면 아무것도 만들지 않고 이유를 출력한 뒤 종료 코드 4이다.
+  명세의 "열린 질문"이 `없음`이 아니면 이슈에 코멘트로 남긴다(`--no-comment`로 끈다). 이슈를 닫거나 라벨·담당자를 바꾸지 않는다.
+- `propose`가 확정 선점이다. 원격에 `spec/<작업 ID>`가 이미 있으면 push하지 않고 종료 코드 4로 거부한다. 내가 올린 명세를 고치는 것이면 `--update`로 `--force-with-lease` 갱신한다. 새 브랜치는 강제 push하지 않으므로 동시에 push하면 한쪽은 git이 거부하고 같은 안내(종료 코드 4)가 나온다.
+- 작업 ID가 `issue-<번호>`면 명세 PR 본문 끝에 `Refs #<번호>`, 구현 PR 본문 끝에 `Closes #<번호>`가 붙는다.
+- main 동기화: `run`은 잠금과 원격 동기화 뒤 단계를 계산하기 전에, 작업 브랜치가 `origin/main`보다 뒤처졌으면(`git merge-base --is-ancestor origin/main HEAD`가 거짓) main을 병합한다. `--no-sync`로 건너뛴다.
+  하네스 커밋이 없으면 fast-forward만 한다. 있으면 병합 커밋(`harness(<id>): sync with main`, 트레일러 `Harness-Step: sync`, `Harness-Merged: <origin/main SHA>`)을 만들어 push한다. 트레일러가 가리키는 SHA가 바뀌지 않도록 rebase하지 않고 병합한다.
+  충돌하면 충돌 표시가 든 채로 커밋하고 `Harness-Conflict: <파일 목록>`을 더한다. 다음 단계는 새 implement 라운드이며 프롬프트에 충돌 파일과 "표시를 모두 없애고 양쪽 의도를 보존하라, main 쪽 변경을 되돌리지 마라"가 들어간다. 그 뒤에도 표시가 남아 있으면(`Harness-Conflict`의 파일에 `<<<<<<<` 또는 `>>>>>>>`로 시작하는 줄이 하나라도 있으면. 표시 길이는 git 기본값 7로 고정하고 `.gitattributes`의 `conflict-marker-size`는 읽지 않는다. `=======`는 Markdown 제목 밑줄과 구별할 수 없어 판정에 쓰지 않으므로, 구분선만 남은 불완전한 해결은 코드면 verify가, 문서면 리뷰가 잡는다. 쉼표·따옴표가 든 경로는 `Harness-Conflict`에 큰따옴표로 감싸 적는다) 리뷰로 가지 않고 `충돌 표시가 남아 있습니다: <파일>` 오류(종료 코드 1)로 멈추며, 다시 `run` 하면 implement 라운드로 이어진다. 충돌 표시가 든 커밋은 verify pass가 아니므로 CI 게이트가 통과시키지 않는다.
+  충돌 없는 병합은 review부터 다시 거친다. `done` 작업이 뒤처졌으면 동기화 → review → verify를 다시 하고 열린 PR이 갱신된다. 동기화는 `--max-rounds`에 세지 않고, 충돌 해결 implement는 센다.
+- `git fetch`와 `git worktree add`는 다른 세션이 저장소 락(`index.lock`, `cannot lock ref` 등)을 잡고 있어 실패하면 2초 간격으로 최대 3번 시도한다. 다른 오류는 재시도하지 않는다.
+- `status`는 작업 브랜치가 `origin/main`보다 뒤처졌으면 `behind main: <n> commits` 줄을 더한다.
+
 ### 잠금
 
 단계를 실행하는 동안 `.harness/locks/<작업 ID>.json`(`pid`, `step`, `started`)을 배타적으로 만들고 끝나면 지운다.
